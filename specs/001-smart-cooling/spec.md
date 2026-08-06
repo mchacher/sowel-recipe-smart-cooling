@@ -125,3 +125,19 @@ States exposed via recipe state key `phase`:
 | Restart during precool                           | Phase restored; no duplicate engage order       |
 | nightOffTime during an active precool            | Night wins: power OFF                           |
 | DST / day rollover                               | Daily latches keyed on local date string        |
+
+## v1.1 addendum (2026-08-06) — full-auto ON/OFF
+
+Owner decision after the first live morning: the AC must be fully managed.
+
+- New phase `cooling` and two slots `comfortOnDelta` / `comfortOffDelta`
+  (default 1°C each): auto-on when `T_int ≥ comfort + onDelta` (from
+  idle/comfort, inside the sunrise→nightOffTime window), auto-off when
+  `T_int ≤ comfort − offDelta` (from cooling only — precool deliberately
+  drives below the band). Pre-cool exit now lands in `cooling` so the
+  house coasts on banked cold until auto-off releases the unit.
+- Auto-on is dormant after the night cut (rollover sets phase idle at
+  midnight; without the time window a warm night would re-engage the AC).
+- The "open the windows" suggestion is bounded to before 13:00 —
+  otherwise any cool evening would fire it on days the morning window
+  never opened.
