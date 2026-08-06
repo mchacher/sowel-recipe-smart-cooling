@@ -166,11 +166,16 @@ describe("smart-cooling instance", () => {
     emit(b.handlers, "weather-1", "temperature", 19);
     expect(b.stateMap.get("openWindows")).toBe(true);
 
-    // T_ext catches up with T_int
+    // T_ext catches up with T_int → close notification, and the hot house
+    // (27 ≥ 26+1) immediately triggers the comfort auto-on.
     emit(b.handlers, "weather-1", "temperature", 26.5);
     expect(b.stateMap.get("openWindows")).toBe(false);
     expect(b.stateMap.get("closeWindows")).toBe(true);
-    expect(b.stateMap.get("phase")).toBe("comfort");
+    expect(b.stateMap.get("phase")).toBe("cooling");
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 26 },
+    ]);
     b.inst.stop();
   });
 
@@ -185,8 +190,8 @@ describe("smart-cooling instance", () => {
   it("precool engages after sustained export on a hot day, single order pair", () => {
     const b = startAt("2026-08-06T13:00:00");
     b.stateMap.set("closeWindowsOn", "2026-08-06"); // airing done
+    emit(b.handlers, "pac-1", "temperature", 26.5); // inside band: no auto-on
     emit(b.handlers, "weather-1", "temperature", 33);
-    emit(b.handlers, "pac-1", "temperature", 27);
     emit(b.handlers, "grid-1", "power", -1500); // exporting 1.5 kW
 
     vi.advanceTimersByTime(16 * 60_000); // > surplusHold
@@ -204,6 +209,7 @@ describe("smart-cooling instance", () => {
 
   it("flapping export never engages", () => {
     const b = startAt("2026-08-06T13:00:00");
+    emit(b.handlers, "pac-1", "temperature", 26.5); // inside band: no auto-on
     emit(b.handlers, "weather-1", "temperature", 33);
     for (let i = 0; i < 10; i++) {
       emit(b.handlers, "grid-1", "power", -1500);
@@ -235,12 +241,13 @@ describe("smart-cooling instance", () => {
     emit(b.handlers, "grid-1", "power", 400); // import: export < 100 W
     vi.advanceTimersByTime(11 * 60_000);
     expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
-    expect(b.stateMap.get("phase")).toBe("comfort");
+    expect(b.stateMap.get("phase")).toBe("cooling"); // AC stays on, auto-off takes over
     b.inst.stop();
   });
 
   it("null grid power resets the engage accumulator", () => {
     const b = startAt("2026-08-06T13:00:00");
+    emit(b.handlers, "pac-1", "temperature", 26.5); // inside band: no auto-on
     emit(b.handlers, "weather-1", "temperature", 33);
     emit(b.handlers, "grid-1", "power", -1500);
     vi.advanceTimersByTime(10 * 60_000);
@@ -313,6 +320,75 @@ describe("smart-cooling instance", () => {
     vi.advanceTimersByTime(16 * 60_000);
     expect(b.stateMap.get("phase")).toBe("precool"); // phase advanced, retry next transition
     inst.stop();
+  });
+
+  it("comfort auto-on: hot house turns the AC on even without surplus", () => {
+    const b = makeCtx();
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    b.stateMap.set("phase", "comfort");
+    b.stateMap.set("day", "2026-08-06");
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "grid-1", "power", 300); // importing, no surplus; tInt seeded 27 ≥ 27
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 26 },
+    ]);
+    expect(b.stateMap.get("phase")).toBe("cooling");
+
+    // Inside the hysteresis band: no further orders
+    emit(b.handlers, "pac-1", "temperature", 26.4);
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(b.orders).toHaveLength(2);
+    inst.stop();
+  });
+
+  it("comfort auto-off: cool house releases the AC", () => {
+    const b = makeCtx();
+    vi.setSystemTime(new Date("2026-08-06T18:00:00"));
+    b.stateMap.set("phase", "cooling");
+    b.stateMap.set("day", "2026-08-06");
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 24.8); // <= 26 - 1
+    expect(b.orders).toEqual([{ equipmentId: "pac-1", alias: "power", value: false }]);
+    expect(b.stateMap.get("phase")).toBe("comfort");
+    inst.stop();
+  });
+
+  it("no auto-on while the airing window is open", () => {
+    const b = startAt("2026-08-06T09:00:00");
+    emit(b.handlers, "pac-1", "temperature", 27.5); // hot inside
+    emit(b.handlers, "weather-1", "temperature", 20); // airing opens (20 < 27)
+    expect(b.stateMap.get("phase")).toBe("airing");
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(b.orders).toHaveLength(0);
+    b.inst.stop();
+  });
+
+  it("no auto-on after the night cut", () => {
+    const b = startAt("2026-08-06T23:05:00");
+    b.stateMap.set("day", "2026-08-06");
+    vi.advanceTimersByTime(30_000); // night cut fires
+    const countAfterCut = b.orders.length;
+    emit(b.handlers, "pac-1", "temperature", 28); // hot but night
+    vi.advanceTimersByTime(10 * 60_000);
+    expect(b.orders).toHaveLength(countAfterCut);
+    expect(b.stateMap.get("phase")).toBe("night_off");
+    b.inst.stop();
+  });
+
+  it("precool exit flows into cooling, then auto-off on the banked cold", () => {
+    const b = startAt("2026-08-06T13:00:00");
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500);
+    vi.advanceTimersByTime(16 * 60_000); // precool engaged
+    emit(b.handlers, "pac-1", "temperature", 24.5); // pre-cooled below comfort band
+    emit(b.handlers, "grid-1", "power", 400); // surplus gone
+    vi.advanceTimersByTime(11 * 60_000); // disengage → cooling
+    expect(b.stateMap.get("phase")).toBe("cooling");
+    vi.advanceTimersByTime(11 * 60_000); // order gap passes → auto-off (24.5 <= 25)
+    expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "power", value: false });
+    expect(b.stateMap.get("phase")).toBe("comfort");
+    b.inst.stop();
   });
 
   it("stop() silences the clock and events", () => {

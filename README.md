@@ -22,11 +22,20 @@ natural morning-airing habit.
    surplus threshold for the hold duration, the AC is switched on at the
    pre-cool setpoint. When the surplus collapses, the comfort setpoint is
    restored.
-3. **Night cut** — at a fixed time, the AC is switched off (once per day).
+3. **Comfort auto-on/off (v1.1, full-auto)** — when the indoor temperature
+   exceeds the comfort setpoint by the auto-on margin (inside the
+   sunrise→night-off window), the AC turns on at the comfort setpoint,
+   surplus or not. When the house is cool enough (comfort minus the
+   auto-off margin), the AC turns off. After a pre-cool episode the house
+   coasts on the banked cold until the auto-off margin releases the unit.
+4. **Night cut** — at a fixed time, the AC is switched off (once per day);
+   the auto-on stays dormant until the next sunrise.
 
-The recipe only issues orders on **phase transitions**: whatever you set
-manually in between is never overridden. While the airing window is open,
-pre-cooling never engages.
+The recipe only issues orders on **phase transitions** (10 min minimum
+between orders): whatever you set manually in between is never
+overridden. While the airing window is open, neither pre-cooling nor the
+comfort auto-on engages. The "open the windows" suggestion is bounded to
+the morning (before 13:00).
 
 ## Slots
 
@@ -37,6 +46,8 @@ pre-cooling never engages.
 | Weather station     | —       | outdoor temperature source                       |
 | Comfort setpoint    | 26 °C   | normal cooling setpoint                          |
 | Pre-cool setpoint   | 24 °C   | setpoint while surplus is available              |
+| Auto-on margin      | 1 °C    | AC on when indoor ≥ comfort + margin             |
+| Auto-off margin     | 1 °C    | AC off when indoor ≤ comfort − margin            |
 | Surplus threshold   | 500 W   | export considered usable                         |
 | Surplus hold        | 15m     | sustained export before engaging                 |
 | Hot day threshold   | 30 °C   | outdoor temp beyond which pre-cooling engages    |
@@ -47,7 +58,7 @@ pre-cooling never engages.
 
 ## State keys (visible in the instance detail, usable in notifications)
 
-- `phase`: `idle | airing | precool | comfort | night_off`
+- `phase`: `idle | airing | precool | cooling | comfort | night_off`
 - `openWindows` / `closeWindows`: daily notification booleans
 
 ## Development

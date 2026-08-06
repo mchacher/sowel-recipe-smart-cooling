@@ -124,6 +124,10 @@ const CLOCK_MS = 30_000;
 const DISENGAGE_EXPORT_W = 100;
 const DISENGAGE_HOLD_MS = 10 * 60_000;
 const MIN_ORDER_GAP_MS = 10 * 60_000;
+// The "open the windows" suggestion is a MORNING thing: without this bound,
+// any cool evening (T_ext dropping back below T_int, i.e. every day) would
+// fire it at dinner time on days when the morning window never opened.
+const AIRING_OPEN_END_MIN = 13 * 60;
 
 // ============================================================
 // Recipe Definition
@@ -212,6 +216,26 @@ export function createRecipe(): RecipeDefinition {
         group: "solar",
       },
       {
+        id: "comfortOnDelta",
+        name: "Auto-on margin",
+        description: "Turn the AC on when indoor exceeds the comfort setpoint by this margin (°C)",
+        type: "number",
+        required: false,
+        defaultValue: 1,
+        constraints: { min: 0.5, max: 3 },
+        group: "setpoints",
+      },
+      {
+        id: "comfortOffDelta",
+        name: "Auto-off margin",
+        description: "Turn the AC off when indoor falls below the comfort setpoint by this margin (°C)",
+        type: "number",
+        required: false,
+        defaultValue: 1,
+        constraints: { min: 0.5, max: 3 },
+        group: "setpoints",
+      },
+      {
         id: "nightOffTime",
         name: "Night off time",
         description: "The AC is switched off at this time (once per day)",
@@ -265,6 +289,14 @@ export function createRecipe(): RecipeDefinition {
           },
           weather: { name: "Station météo", description: "Source de la température extérieure" },
           comfortSetpoint: { name: "Consigne confort", description: "Consigne normale de refroidissement (°C)" },
+          comfortOnDelta: {
+            name: "Marge d'allumage auto",
+            description: "Allume la clim quand l'intérieur dépasse la consigne confort de cette marge (°C)",
+          },
+          comfortOffDelta: {
+            name: "Marge d'extinction auto",
+            description: "Éteint la clim quand l'intérieur descend sous la consigne confort de cette marge (°C)",
+          },
           precoolSetpoint: {
             name: "Consigne pré-refroidissement",
             description: "Consigne abaissée pendant le surplus solaire (°C)",
@@ -355,6 +387,8 @@ export function createRecipe(): RecipeDefinition {
       const surplusThreshold = Number(params.surplusThreshold ?? 500);
       const surplusHoldMs = ctx.helpers.parseDuration(params.surplusHold ?? "15m");
       const hotDayThreshold = Number(params.hotDayThreshold ?? 30);
+      const comfortOnDelta = Number(params.comfortOnDelta ?? 1);
+      const comfortOffDelta = Number(params.comfortOffDelta ?? 1);
       const nightOffMin = hmToMinutes(String(params.nightOffTime ?? "23:00"));
       const airingEnabled = params.airingEnabled !== false;
       const airingMinOutdoor = Number(params.airingMinOutdoor ?? 18);
@@ -469,6 +503,7 @@ export function createRecipe(): RecipeDefinition {
           if (
             str("openWindowsOn") !== today &&
             str("closeWindowsOn") !== today &&
+            nowMin <= AIRING_OPEN_END_MIN &&
             tExt >= airingMinOutdoor &&
             tExt < tInt - airingMargin
           ) {
@@ -511,10 +546,46 @@ export function createRecipe(): RecipeDefinition {
           return;
         }
 
-        // 4. Pre-cool exit: surplus collapsed → back to comfort setpoint
+        // 4. Pre-cool exit: surplus collapsed → back to the comfort setpoint.
+        // The AC stays ON (phase "cooling") — the auto-off rule below takes
+        // over: with a pre-cooled house it releases quickly and the house
+        // coasts on the banked cold.
         if (phase === "precool" && lowExportSince !== null && now - lowExportSince >= DISENGAGE_HOLD_MS) {
           sendOrder(setpointOrderAlias, comfortSetpoint, "surplus over, comfort setpoint", true);
-          setPhase("comfort");
+          setPhase("cooling");
+        }
+
+        // 5. Comfort auto-on: house too warm → AC ON at the comfort setpoint,
+        // surplus or not (full-auto mode). Only from idle/comfort — airing,
+        // precool, cooling and night_off all have their own rules — and only
+        // inside the sunrise→nightOffTime window: after the daily rollover
+        // the phase is idle again, and without this gate a warm night would
+        // re-engage the AC at midnight, defeating the night cut.
+        if (
+          (phase === "idle" || phase === "comfort") &&
+          nowMin >= sunriseMin() &&
+          nowMin < nightOffMin &&
+          tInt !== null &&
+          tInt >= comfortSetpoint + comfortOnDelta
+        ) {
+          if (sendOrder(powerOrderAlias, true, "comfort auto-on")) {
+            sendOrder(setpointOrderAlias, comfortSetpoint, "comfort setpoint", true);
+            setPhase("cooling");
+          }
+          return;
+        }
+
+        // 6. Comfort auto-off: the house is cool enough on its own → AC OFF.
+        // Only from "cooling" (never during precool: the unit is deliberately
+        // driving below the comfort setpoint there).
+        if (
+          phase === "cooling" &&
+          tInt !== null &&
+          tInt <= comfortSetpoint - comfortOffDelta
+        ) {
+          if (sendOrder(powerOrderAlias, false, "comfort auto-off")) {
+            setPhase("comfort");
+          }
         }
       };
 
