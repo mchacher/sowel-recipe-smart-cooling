@@ -1,0 +1,18 @@
+{
+  "id": "smart-cooling",
+  "type": "recipe",
+  "name": "Smart Cooling",
+  "version": "1.0.0",
+  "description": "Solar-aware AC optimizer: morning airing notifications, pre-cooling on solar surplus, comfort setpoint, fixed-time night cut",
+  "icon": "Snowflake",
+  "repo": "mchacher/sowel-recipe-smart-cooling",
+  "author": "mchacher",
+  "tags": ["cooling", "ac", "solar", "energy", "automation"],
+  "i18n": {
+    "fr": {
+      "name": "Clim intelligente",
+      "description": "Optimise la climatisation avec le solaire : notifications d'aération le matin, pré-refroidissement sur surplus solaire, consigne confort, extinction nocturne à heure fixe."
+    }
+  },
+  "sowelVersion": ">=1.31.1"
+}
