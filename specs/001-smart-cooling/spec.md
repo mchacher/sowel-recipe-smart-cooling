@@ -141,3 +141,22 @@ Owner decision after the first live morning: the AC must be fully managed.
 - The "open the windows" suggestion is bounded to before 13:00 —
   otherwise any cool evening would fire it on days the morning window
   never opened.
+
+## v1.2.0 addendum (2026-08-07) — dedicated indoor sensor
+
+First-morning live incident: the PAC (Panasonic) held a frozen indoor
+temperature (26°C for 11 h while off overnight), then jumped to the real
+22°C at 06:52. Morning airing fired `openWindows` at dawn on the stale 26,
+then `closeWindows` 24 min later when the fresh 22 arrived (T_ext 21.7 ≥
+22 − margin) — a confusing pair, the "close" landing while outdoor was
+still below indoor. The weather station's indoor module, by contrast,
+tracked a smooth reliable curve all night (27.4 → 26.5).
+
+Fix: new optional `indoorSensor` equipment slot (default = the AC's own
+sensor, backward compatible). When set to a continuously-reporting sensor
+(weather station indoor module, dedicated probe), T_int is read from it
+for both airing and comfort auto on/off, avoiding the frozen-AC-sensor
+trap. Slots renamed to describe what they provide: "Outdoor temperature"
+(was "Weather station") and "Indoor temperature". Event matching made
+independent so one equipment can feed both readings (a weather station
+providing temperature_outdoor + temperature).
