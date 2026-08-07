@@ -36,7 +36,15 @@ function makeCtx(overrides?: {
     },
     "weather-1": {
       name: "Station",
-      dataBindings: [{ alias: "temperature", category: "temperature_outdoor", value: 20 }],
+      dataBindings: [
+        { alias: "temperature", category: "temperature_outdoor", value: 20 },
+        { alias: "temperature_2", category: "temperature", value: 25 }, // indoor module
+      ],
+      orderBindings: [],
+    },
+    "sensor-1": {
+      name: "Capteur Salon",
+      dataBindings: [{ alias: "temperature", category: "temperature", value: 25 }],
       orderBindings: [],
     },
   };
@@ -389,6 +397,57 @@ describe("smart-cooling instance", () => {
     expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "power", value: false });
     expect(b.stateMap.get("phase")).toBe("comfort");
     b.inst.stop();
+  });
+
+  it("indoorSensor: T_int comes from the configured sensor, PAC sensor ignored", () => {
+    const b = makeCtx();
+    vi.setSystemTime(new Date("2026-08-07T15:00:00"));
+    b.stateMap.set("phase", "comfort");
+    b.stateMap.set("day", "2026-08-07");
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, indoorSensor: "sensor-1" },
+      b.ctx as never,
+    );
+    // The PAC's own (frozen) sensor says 22 — must NOT trigger anything.
+    emit(b.handlers, "pac-1", "temperature", 22);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(b.orders).toHaveLength(0);
+    // The configured indoor sensor rising above comfort+delta drives auto-on.
+    emit(b.handlers, "sensor-1", "temperature", 27.5);
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 26 },
+    ]);
+    inst.stop();
+  });
+
+  it("indoorSensor empty: falls back to the PAC's own sensor (default)", () => {
+    const b = makeCtx();
+    vi.setSystemTime(new Date("2026-08-07T15:00:00"));
+    b.stateMap.set("phase", "comfort");
+    b.stateMap.set("day", "2026-08-07");
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 27.5); // PAC drives it when no sensor set
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 26 },
+    ]);
+    inst.stop();
+  });
+
+  it("indoorSensor same as the weather station: outdoor and indoor both tracked", () => {
+    const b = makeCtx();
+    vi.setSystemTime(new Date("2026-08-07T07:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, indoorSensor: "weather-1" },
+      b.ctx as never,
+    );
+    // weather-1 feeds outdoor via `temperature` (temperature_outdoor) AND
+    // indoor via `temperature_2` (temperature). Indoor 25, outdoor 19 → airing opens.
+    emit(b.handlers, "weather-1", "temperature_2", 25);
+    emit(b.handlers, "weather-1", "temperature", 19);
+    expect(b.stateMap.get("openWindows")).toBe(true);
+    inst.stop();
   });
 
   it("stop() silences the clock and events", () => {

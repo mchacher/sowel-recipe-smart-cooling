@@ -160,11 +160,20 @@ export function createRecipe(): RecipeDefinition {
       },
       {
         id: "weather",
-        name: "Weather station",
-        description: "Source of the outdoor temperature",
+        name: "Outdoor temperature",
+        description: "Equipment providing the outdoor temperature (e.g. a weather station)",
         type: "equipment",
         required: true,
         constraints: { equipmentType: "weather", crossZone: true },
+      },
+      {
+        id: "indoorSensor",
+        name: "Indoor temperature",
+        description:
+          "Equipment providing the indoor temperature. Leave empty to use the AC's own sensor — but a continuously-reporting sensor (e.g. a weather station indoor module) is strongly recommended: an AC's built-in probe freezes its last value while the unit is off, which misleads the morning airing and the auto on/off.",
+        type: "equipment",
+        required: false,
+        constraints: { equipmentType: ["weather", "sensor", "thermostat"], crossZone: true },
       },
       {
         id: "comfortSetpoint",
@@ -287,7 +296,15 @@ export function createRecipe(): RecipeDefinition {
             name: "Compteur principal",
             description: "Compteur principal avec puissance signée (+soutirage / −injection)",
           },
-          weather: { name: "Station météo", description: "Source de la température extérieure" },
+          weather: {
+            name: "Température extérieure",
+            description: "Équipement fournissant la température extérieure (ex. une station météo)",
+          },
+          indoorSensor: {
+            name: "Température intérieure",
+            description:
+              "Équipement fournissant la température intérieure. Vide = capteur interne de la clim, mais un capteur qui remonte en continu (ex. module intérieur d'une station météo) est fortement recommandé : la sonde interne d'une clim fige sa dernière valeur quand l'unité est éteinte, ce qui trompe l'aération du matin et l'allumage/extinction auto.",
+          },
           comfortSetpoint: { name: "Consigne confort", description: "Consigne normale de refroidissement (°C)" },
           comfortOnDelta: {
             name: "Marge d'allumage auto",
@@ -382,6 +399,13 @@ export function createRecipe(): RecipeDefinition {
       const pacId = params.pac as string;
       const gridId = params.gridMeter as string;
       const weatherId = params.weather as string;
+      // Indoor temperature source: a dedicated sensor if configured, else the
+      // AC's own probe (unreliable while the unit is off — see indoorSensor
+      // slot description). Falls back to the PAC if the configured id is gone.
+      const indoorId =
+        typeof params.indoorSensor === "string" && params.indoorSensor
+          ? params.indoorSensor
+          : pacId;
       const comfortSetpoint = Number(params.comfortSetpoint ?? 26);
       const precoolSetpoint = Number(params.precoolSetpoint ?? 24);
       const surplusThreshold = Number(params.surplusThreshold ?? 500);
@@ -398,6 +422,7 @@ export function createRecipe(): RecipeDefinition {
       const pacEq = ctx.equipmentManager.getByIdWithDetails(pacId);
       const gridEq = ctx.equipmentManager.getByIdWithDetails(gridId);
       const weatherEq = ctx.equipmentManager.getByIdWithDetails(weatherId);
+      const indoorEq = ctx.equipmentManager.getByIdWithDetails(indoorId) ?? pacEq;
 
       const gridPowerAlias =
         gridEq?.dataBindings.find((b) => b.category === "power")?.alias ??
@@ -408,7 +433,9 @@ export function createRecipe(): RecipeDefinition {
         weatherEq?.dataBindings.find((b) => b.alias === "temperature")?.alias ??
         "temperature";
       const tIntAlias =
-        pacEq?.dataBindings.find((b) => b.category === "temperature")?.alias ?? "temperature";
+        indoorEq?.dataBindings.find((b) => b.category === "temperature")?.alias ??
+        indoorEq?.dataBindings.find((b) => b.alias === "temperature")?.alias ??
+        "temperature";
       const powerOrderAlias =
         pacEq?.orderBindings.find((o) => o.category === "toggle_power")?.alias ?? "power";
       const setpointOrderAlias =
@@ -419,7 +446,7 @@ export function createRecipe(): RecipeDefinition {
         typeof v === "number" && Number.isFinite(v) ? v : null;
       let gridPower = num(gridEq?.dataBindings.find((b) => b.alias === gridPowerAlias)?.value);
       let tExt = num(weatherEq?.dataBindings.find((b) => b.alias === tExtAlias)?.value);
-      let tInt = num(pacEq?.dataBindings.find((b) => b.alias === tIntAlias)?.value);
+      let tInt = num(indoorEq?.dataBindings.find((b) => b.alias === tIntAlias)?.value);
 
       // ── Persisted daily latches / phase ─────────────────────
       const s = ctx.state;
@@ -599,10 +626,24 @@ export function createRecipe(): RecipeDefinition {
           if (lastSeen.get(key) === value) return; // edge guard (re-fired events)
           lastSeen.set(key, value);
 
-          if (eqId === gridId && alias === gridPowerAlias) gridPower = num(value);
-          else if (eqId === weatherId && alias === tExtAlias) tExt = num(value);
-          else if (eqId === pacId && alias === tIntAlias) tInt = num(value);
-          else return;
+          // Independent checks (not else-if): the indoor sensor may be the
+          // same equipment as the outdoor one (a weather station providing
+          // both temperature_outdoor and temperature), so one equipment can
+          // feed either reading depending on the alias.
+          let matched = false;
+          if (eqId === gridId && alias === gridPowerAlias) {
+            gridPower = num(value);
+            matched = true;
+          }
+          if (eqId === weatherId && alias === tExtAlias) {
+            tExt = num(value);
+            matched = true;
+          }
+          if (eqId === indoorId && alias === tIntAlias) {
+            tInt = num(value);
+            matched = true;
+          }
+          if (!matched) return;
           evaluate();
         } catch (err) {
           ctx.logger.error({ err }, "smart-cooling: event handler error");

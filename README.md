@@ -43,7 +43,8 @@ the morning (before 13:00).
 | ------------------- | ------- | ------------------------------------------------ |
 | Air conditioner     | —       | thermostat with power + setpoint orders          |
 | Grid meter          | —       | main energy meter, signed power (+import/−export)|
-| Weather station     | —       | outdoor temperature source                       |
+| Outdoor temperature | —       | equipment providing outdoor temp (weather station)|
+| Indoor temperature  | AC probe | optional; a continuous sensor (weather indoor module) is strongly recommended — the AC's own probe freezes while off |
 | Comfort setpoint    | 26 °C   | normal cooling setpoint                          |
 | Pre-cool setpoint   | 24 °C   | setpoint while surplus is available              |
 | Auto-on margin      | 1 °C    | AC on when indoor ≥ comfort + margin             |
