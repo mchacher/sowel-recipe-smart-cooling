@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createRecipe, hmToMinutes, exportWatts, localDay } from "./index.js";
+import { createRecipe, hmToMinutes, exportWatts, localDay, prePeakOffPeakWindow } from "./index.js";
 
 // ============================================================
 // Test harness — fake RecipeContext
@@ -7,15 +7,24 @@ import { createRecipe, hmToMinutes, exportWatts, localDay } from "./index.js";
 
 type Handler = (event: Record<string, unknown>) => void;
 
+interface FakeTariff {
+  configured: boolean;
+  offPeakToday: Array<{ start: string; end: string }>;
+  isOffPeakNow: boolean | null;
+}
+
 function makeCtx(overrides?: {
   sunrise?: string;
   sunset?: string;
   pacOrders?: Array<{ alias: string; category?: string }>;
+  /** When set, ctx.helpers.getTariff is exposed (Sowel >= 1.37); absent otherwise. */
+  tariff?: FakeTariff;
 }) {
   const handlers: Handler[] = [];
   const stateMap = new Map<string, unknown>();
   const orders: Array<{ equipmentId: string; alias: string; value: unknown }> = [];
   const logs: string[] = [];
+  const tariffOverride = overrides?.tariff;
 
   const equipments: Record<string, { name: string; dataBindings: unknown[]; orderBindings: unknown[] }> = {
     "pac-1": {
@@ -84,6 +93,7 @@ function makeCtx(overrides?: {
         sunset: overrides?.sunset ?? "21:00",
         isDaylight: true,
       }),
+      ...(tariffOverride !== undefined ? { getTariff: () => tariffOverride } : {}),
     },
     dispatchOrder: (equipmentId: string, alias: string, value: unknown) => {
       orders.push({ equipmentId, alias, value });
@@ -126,6 +136,37 @@ describe("helpers", () => {
     expect(exportWatts(300)).toBe(0);
     expect(exportWatts(null)).toBeNull();
     expect(exportWatts(NaN)).toBeNull();
+  });
+
+  it("prePeakOffPeakWindow selects the afternoon slot only", () => {
+    const night = { start: "00:04", end: "05:34" };
+    const afternoon = { start: "14:34", end: "17:04" };
+    const wrapped = { start: "22:00", end: "06:00" };
+    const NIGHT_OFF = 23 * 60;
+
+    expect(prePeakOffPeakWindow([night, afternoon, wrapped], NIGHT_OFF)).toEqual({
+      startMin: 14 * 60 + 34,
+      endMin: 17 * 60 + 4,
+    });
+    // night-only contracts (with or without midnight wrap) → no window
+    expect(prePeakOffPeakWindow([night, wrapped], NIGHT_OFF)).toBeNull();
+    expect(prePeakOffPeakWindow([], NIGHT_OFF)).toBeNull();
+    // ends before noon → banks cold the day then wastes
+    expect(prePeakOffPeakWindow([{ start: "09:00", end: "11:30" }], NIGHT_OFF)).toBeNull();
+    // ends past the night cut → the night cut's territory
+    expect(prePeakOffPeakWindow([{ start: "22:00", end: "23:30" }], NIGHT_OFF)).toBeNull();
+    // several candidates → the latest-ending one (closest to the peak)
+    expect(
+      prePeakOffPeakWindow(
+        [
+          { start: "12:00", end: "13:00" },
+          { start: "15:00", end: "17:00" },
+        ],
+        NIGHT_OFF,
+      ),
+    ).toEqual({ startMin: 15 * 60, endMin: 17 * 60 });
+    // malformed slots are ignored
+    expect(prePeakOffPeakWindow([{ start: "bad", end: "17:00" }], NIGHT_OFF)).toBeNull();
   });
 });
 
@@ -456,5 +497,110 @@ describe("smart-cooling instance", () => {
     emit(b.handlers, "grid-1", "power", -1500);
     vi.advanceTimersByTime(60 * 60_000);
     expect(b.orders).toHaveLength(0);
+  });
+});
+
+describe("off-peak boost (issue #3)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const TARIFF: FakeTariff = {
+    configured: true,
+    offPeakToday: [
+      { start: "00:04", end: "05:34" },
+      { start: "14:34", end: "17:04" },
+    ],
+    isOffPeakNow: true,
+  };
+
+  it("engages inside the window on a hot day with zero surplus, releases at window end", () => {
+    const b = makeCtx({ tariff: TARIFF });
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+
+    // Grid stays at +200 W import (seeded binding) — no surplus at all.
+    emit(b.handlers, "weather-1", "temperature", 32); // hot day
+    expect(b.stateMap.get("phase")).toBe("precool");
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 24 },
+    ]);
+
+    // Window over (17:04) → hand back to the comfort setpoint, AC stays on.
+    vi.setSystemTime(new Date("2026-08-06T17:05:00"));
+    vi.advanceTimersByTime(30_000);
+    expect(b.stateMap.get("phase")).toBe("cooling");
+    expect(b.orders[2]).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
+    expect(b.orders).toHaveLength(3);
+    inst.stop();
+  });
+
+  it("stays idle outside the window (peak hours) without surplus", () => {
+    const b = makeCtx({ tariff: TARIFF });
+    // 13:30: HP before the window, and past the morning-airing latch (13:00)
+    vi.setSystemTime(new Date("2026-08-06T13:30:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 26); // below the auto-on margin
+    emit(b.handlers, "weather-1", "temperature", 32);
+    expect(b.orders).toEqual([]);
+    expect(b.stateMap.get("phase")).toBe("idle");
+    inst.stop();
+  });
+
+  it("does not engage on a mild day even inside the window", () => {
+    const b = makeCtx({ tariff: TARIFF });
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 25);
+    emit(b.handlers, "weather-1", "temperature", 25); // not hot
+    expect(b.orders).toEqual([]);
+    inst.stop();
+  });
+
+  it("inert when the tariff is not configured", () => {
+    const b = makeCtx({ tariff: { configured: false, offPeakToday: [], isOffPeakNow: null } });
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 26);
+    emit(b.handlers, "weather-1", "temperature", 32);
+    expect(b.orders).toEqual([]);
+    inst.stop();
+  });
+
+  it("inert on a night-only contract", () => {
+    const b = makeCtx({
+      tariff: { configured: true, offPeakToday: [{ start: "00:04", end: "05:34" }], isOffPeakNow: false },
+    });
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 26);
+    emit(b.handlers, "weather-1", "temperature", 32);
+    expect(b.orders).toEqual([]);
+    inst.stop();
+  });
+
+  it("inert when disabled via the slot", () => {
+    const b = makeCtx({ tariff: TARIFF });
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance({ ...PARAMS, tariffBoostEnabled: false }, b.ctx as never);
+    emit(b.handlers, "pac-1", "temperature", 26);
+    emit(b.handlers, "weather-1", "temperature", 32);
+    expect(b.orders).toEqual([]);
+    inst.stop();
+  });
+
+  it("old core without getTariff: inert with a warning, no crash", () => {
+    const b = makeCtx(); // helper absent
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    expect(b.logs.some((l) => l.includes("getTariff"))).toBe(true);
+    emit(b.handlers, "pac-1", "temperature", 26);
+    emit(b.handlers, "weather-1", "temperature", 32);
+    expect(b.orders).toEqual([]);
+    inst.stop();
   });
 });

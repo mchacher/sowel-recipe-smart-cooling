@@ -22,6 +22,14 @@ natural morning-airing habit.
    surplus threshold for the hold duration, the AC is switched on at the
    pre-cool setpoint. When the surplus collapses, the comfort setpoint is
    restored.
+   **Off-peak boost (v1.3)** — on the same hot days, pre-cooling also
+   engages during the afternoon off-peak tariff window (the off-peak
+   slot ending between noon and the night cut), even with zero surplus:
+   cheap grid energy banks cold right before the expensive evening. The
+   window comes from the core tariff schedule (`getTariff()`, Sowel
+   ≥ 1.37, spec 138) — nothing is hardcoded. Night-only contracts and
+   unconfigured tariffs leave the boost inert; on older cores the recipe
+   logs a warning and behaves exactly as before.
 3. **Comfort auto-on/off (v1.1, full-auto)** — when the indoor temperature
    exceeds the comfort setpoint by the auto-on margin (inside the
    sunrise→night-off window), the AC turns on at the comfort setpoint,
@@ -52,6 +60,7 @@ the morning (before 13:00).
 | Surplus threshold   | 500 W   | export considered usable                         |
 | Surplus hold        | 15m     | sustained export before engaging                 |
 | Hot day threshold   | 30 °C   | outdoor temp beyond which pre-cooling engages    |
+| Off-peak boost      | on      | pre-cool during the afternoon off-peak window (Sowel ≥ 1.37) |
 | Night off time      | 23:00   | daily AC cut                                     |
 | Airing notifications| on      | morning open/close notifications                 |
 | Airing minimum      | 18 °C   | "bearable" floor to suggest opening              |
@@ -66,7 +75,7 @@ the morning (before 13:00).
 
 ```bash
 npm install
-npm test          # vitest, 18 scenarios
+npm test          # vitest, 34 scenarios
 npm run build     # tsc → dist/
 ```
 
