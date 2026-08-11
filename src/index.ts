@@ -5,10 +5,13 @@
 //  1. Morning airing (notify only): `openWindows` rises when outdoor air
 //     is bearable and still cooler than indoors; `closeWindows` rises when
 //     outdoor catches up with indoor. Map both to notifications.
-//  2. Pre-cooling: on a hot day with sustained grid export — or, since
-//     v1.3.0, during the afternoon off-peak tariff window (issue #3) —
-//     run the AC at a lower setpoint to bank cooling with energy that is
-//     otherwise injected or cheap.
+//  2. Pre-cooling: on a hot day when solar surplus is available — via the
+//     capacity arbiter when it is enabled (v1.4.0), otherwise self-detected
+//     from sustained grid export — or during the afternoon off-peak tariff
+//     window (v1.3.0, issue #3). Runs the AC at a lower setpoint to bank
+//     cooling with energy that is otherwise injected or cheap. The arbiter
+//     path degrades gracefully: no helper, arbiter off, no production, or an
+//     unprofiled AC all fall back to the grid-export self-detection.
 //  3. Comfort: restore the normal setpoint when neither signal holds.
 //  4. Night cut: switch the AC off at a fixed time (once per day).
 //
@@ -26,6 +29,31 @@ interface OrderBindingLite {
   alias: string;
   category?: string;
   type?: string;
+}
+// Spec 140 capacity-arbiter helpers, mirrored from core (recipes don't import
+// core). All optional at the call site — see the `energy?` helper below.
+interface CapacityClaimReq {
+  equipmentId: string;
+  watts?: number;
+  toleratedImportW?: number;
+  slack?: "none" | "some" | "high";
+  note?: string;
+  onGranted: () => void;
+  onRevoked: (reason: string) => void;
+}
+interface CapacityHandle {
+  id: string;
+  status(): "pending" | "granted" | "denied" | "released";
+  deniedReason?: string;
+  release(): void;
+}
+interface EnergyHelpers {
+  claimCapacity(req: CapacityClaimReq): CapacityHandle;
+  getCapacityState(): {
+    enabled: boolean;
+    availableSurplusW: number | null;
+    grants: Array<{ equipmentId: string; watts: number; sinceIso: string }>;
+  };
 }
 interface RecipeContext {
   eventBus: {
@@ -66,6 +94,11 @@ interface RecipeContext {
       offPeakToday: Array<{ start: string; end: string }>;
       isOffPeakNow: boolean | null;
     };
+    // Spec 140, Sowel >= 1.39.0. Optional: on older cores, when the arbiter is
+    // off, or the home has no production, this helper is absent or claimCapacity
+    // returns a denied handle, and the recipe self-detects surplus from the grid
+    // meter's export exactly as in v1.3.0.
+    energy?: EnergyHelpers;
   };
   dispatchOrder(equipmentId: string, alias: string, value: unknown): Promise<void>;
 }
@@ -523,6 +556,51 @@ export function createRecipe(): RecipeDefinition {
       const lastSeen = new Map<string, unknown>();
       let stopped = false;
 
+      // ── Surplus arbiter (spec 140) ──────────────────────────
+      // When the core exposes ctx.helpers.energy AND the arbiter is enabled,
+      // the recipe holds a claim on the AC while pre-cooling is a candidate and
+      // pre-cools on the arbiter's grant, instead of reading raw grid export.
+      // When the helper is absent, the arbiter is off, or the AC is not
+      // profiled (claim denied), `claim` is null/denied and the raw-export
+      // detection below drives pre-cooling exactly as before.
+      let claim: CapacityHandle | null = null;
+      let arbiterGranted = false;
+      let evalScheduled = false;
+      let notWantingSince: number | null = null; // debounce claim release (anti-thrash)
+      const CLAIM_RELEASE_HOLD_MS = 5 * 60_000;
+      const arbiterEnabled = (): boolean => {
+        try {
+          return !!ctx.helpers.energy && ctx.helpers.energy.getCapacityState().enabled;
+        } catch {
+          return false;
+        }
+      };
+      const releaseClaim = () => {
+        try {
+          if (claim) claim.release();
+        } catch {
+          /* a broken handle must not break the recipe */
+        }
+        claim = null;
+        arbiterGranted = false;
+        notWantingSince = null;
+      };
+      // The arbiter may invoke onGranted/onRevoked synchronously from inside
+      // claimCapacity(); defer the re-evaluation to the next tick so it never
+      // re-enters the evaluate() pass that created the claim.
+      const scheduleEvaluate = () => {
+        if (evalScheduled || stopped) return;
+        evalScheduled = true;
+        setTimeout(() => {
+          evalScheduled = false;
+          try {
+            if (!stopped) evaluate();
+          } catch (err) {
+            ctx.logger.error({ err }, "smart-cooling: deferred evaluate failed");
+          }
+        }, 0);
+      };
+
       // ── Order helper: transitions only, never throws ────────
       const sendOrder = (alias: string, value: unknown, why: string, exemptGap = false) => {
         const now = Date.now();
@@ -574,6 +652,7 @@ export function createRecipe(): RecipeDefinition {
           s.set("nightOffOn", today);
           sendOrder(powerOrderAlias, false, "night cut", true);
           setPhase("night_off");
+          releaseClaim(); // the AC is off for the night — free the reservation
           return;
         }
         if (phase === "night_off") return; // dormant until rollover
@@ -618,16 +697,76 @@ export function createRecipe(): RecipeDefinition {
 
         let inBoostWindow = false;
         if (tariffBoostEnabled && hot) {
-          const tariff = ctx.helpers.getTariff?.();
-          if (tariff?.configured) {
-            const win = prePeakOffPeakWindow(tariff.offPeakToday, nightOffMin);
-            inBoostWindow = win !== null && nowMin >= win.startMin && nowMin < win.endMin;
+          try {
+            const tariff = ctx.helpers.getTariff?.();
+            if (tariff?.configured && Array.isArray(tariff.offPeakToday)) {
+              const win = prePeakOffPeakWindow(tariff.offPeakToday, nightOffMin);
+              inBoostWindow = win !== null && nowMin >= win.startMin && nowMin < win.endMin;
+            }
+          } catch (err) {
+            ctx.logger.error({ err }, "smart-cooling: getTariff failed");
           }
         }
 
-        const surplusReady = daytime && exportSince !== null && now - exportSince >= surplusHoldMs;
+        // Surplus signal: defer to the arbiter when it manages this AC,
+        // otherwise self-detect from sustained grid export (v1.3.0 fallback).
+        const rawSurplusReady = daytime && exportSince !== null && now - exportSince >= surplusHoldMs;
+
+        // Hold a claim on the AC while pre-cooling is a candidate (hot, daytime,
+        // not airing/night); the arbiter grants when real surplus exists.
+        const wantClaim =
+          arbiterEnabled() && hot && daytime && phase !== "airing" && phase !== "night_off";
+        if (wantClaim) {
+          notWantingSince = null;
+          if (!claim && ctx.helpers.energy) {
+            try {
+              claim =
+                ctx.helpers.energy.claimCapacity({
+                  equipmentId: pacId,
+                  toleratedImportW: 0,
+                  slack: "some",
+                  note: "precool boost",
+                  onGranted: () => {
+                    arbiterGranted = true;
+                    scheduleEvaluate();
+                  },
+                  onRevoked: () => {
+                    arbiterGranted = false;
+                    scheduleEvaluate();
+                  },
+                }) ?? null;
+            } catch (err) {
+              ctx.logger.error({ err }, "smart-cooling: claimCapacity failed");
+              claim = null;
+              arbiterGranted = false; // a sync onGranted-then-throw must not leave a stale grant
+            }
+          }
+        } else if (claim) {
+          // Debounced release: a brief dip below `hot` must not thrash the
+          // arbiter with rapid claim/release churn.
+          notWantingSince ??= now;
+          if (now - notWantingSince >= CLAIM_RELEASE_HOLD_MS) releaseClaim();
+        }
+        // The arbiter manages this AC only if the claim exists and was not
+        // denied (e.g. the AC carries no energy profile); otherwise fall back.
+        let arbiterManaging = false;
+        if (claim) {
+          try {
+            arbiterManaging = claim.status() !== "denied";
+          } catch {
+            arbiterManaging = false;
+          }
+        }
+        const surplusReady = arbiterManaging ? arbiterGranted : rawSurplusReady;
+
         if (phase !== "precool" && phase !== "airing" && hot && (surplusReady || inBoostWindow)) {
-          if (sendOrder(powerOrderAlias, true, surplusReady ? "precool engage (surplus)" : "precool engage (off-peak)")) {
+          if (
+            sendOrder(
+              powerOrderAlias,
+              true,
+              surplusReady ? "precool engage (surplus)" : "precool engage (off-peak)",
+            )
+          ) {
             sendOrder(setpointOrderAlias, precoolSetpoint, "precool setpoint", true);
             setPhase("precool");
           }
@@ -641,12 +780,10 @@ export function createRecipe(): RecipeDefinition {
         // the banked cold. A boost engaged with zero surplus has had
         // `lowExportSince` running since engage, so the window end alone
         // releases it.
-        if (
-          phase === "precool" &&
-          !inBoostWindow &&
-          lowExportSince !== null &&
-          now - lowExportSince >= DISENGAGE_HOLD_MS
-        ) {
+        const surplusGone = arbiterManaging
+          ? !arbiterGranted
+          : lowExportSince !== null && now - lowExportSince >= DISENGAGE_HOLD_MS;
+        if (phase === "precool" && !inBoostWindow && surplusGone) {
           sendOrder(setpointOrderAlias, comfortSetpoint, "precool over, comfort setpoint", true);
           setPhase("cooling");
         }
@@ -736,12 +873,18 @@ export function createRecipe(): RecipeDefinition {
       ctx.log(
         `Smart Cooling started (comfort=${comfortSetpoint}°C, precool=${precoolSetpoint}°C, surplus≥${surplusThreshold}W for ${ctx.helpers.formatDuration(surplusHoldMs)}, off-peak boost ${tariffBoostEnabled ? "on" : "off"}, night off ${String(params.nightOffTime ?? "23:00")})`,
       );
+      ctx.log(
+        ctx.helpers.energy
+          ? "Surplus arbiter available. Pre-cooling follows its grants when enabled; grid-export self-detection is the fallback."
+          : "No surplus arbiter on this core (needs Sowel 1.39+). Self-detecting surplus from grid export.",
+      );
 
       return {
         stop() {
           stopped = true;
           clearInterval(clock);
           unsub();
+          releaseClaim();
         },
       };
     },

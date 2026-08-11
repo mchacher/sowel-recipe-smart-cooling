@@ -19,6 +19,8 @@ function makeCtx(overrides?: {
   pacOrders?: Array<{ alias: string; category?: string }>;
   /** When set, ctx.helpers.getTariff is exposed (Sowel >= 1.37); absent otherwise. */
   tariff?: FakeTariff;
+  /** When set, ctx.helpers.energy is exposed (Sowel >= 1.39, spec 140). */
+  energy?: unknown;
 }) {
   const handlers: Handler[] = [];
   const stateMap = new Map<string, unknown>();
@@ -94,6 +96,7 @@ function makeCtx(overrides?: {
         isDaylight: true,
       }),
       ...(tariffOverride !== undefined ? { getTariff: () => tariffOverride } : {}),
+      ...(overrides?.energy !== undefined ? { energy: overrides.energy } : {}),
     },
     dispatchOrder: (equipmentId: string, alias: string, value: unknown) => {
       orders.push({ equipmentId, alias, value });
@@ -102,6 +105,52 @@ function makeCtx(overrides?: {
   };
 
   return { ctx, handlers, stateMap, orders, logs };
+}
+
+// Fake capacity arbiter (spec 140). `grant()`/`revoke()` drive the recipe's
+// onGranted/onRevoked callbacks, exactly as the real arbiter would.
+function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
+  const enabled = opts?.enabled ?? true;
+  let status: "pending" | "granted" | "denied" | "released" = "pending";
+  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null = null;
+  let releaseCount = 0;
+  const handle = {
+    id: "claim-1",
+    status: () => status,
+    deniedReason: opts?.denied ? "not-profiled" : undefined,
+    release: () => {
+      status = "released";
+      releaseCount++;
+    },
+  };
+  return {
+    energy: {
+      claimCapacity: (r: { onGranted: () => void; onRevoked: (r: string) => void }) => {
+        req = r;
+        status = opts?.denied ? "denied" : "pending";
+        return handle;
+      },
+      getCapacityState: () => ({
+        enabled,
+        availableSurplusW: enabled ? 800 : null,
+        grants: [] as Array<{ equipmentId: string; watts: number; sinceIso: string }>,
+      }),
+    },
+    grant: () => {
+      if (status === "pending") {
+        status = "granted";
+        req?.onGranted();
+      }
+    },
+    revoke: () => {
+      if (status === "granted") {
+        status = "pending";
+        req?.onRevoked("surplus-deficit");
+      }
+    },
+    claimed: () => req !== null && status !== "released",
+    released: () => releaseCount > 0,
+  };
 }
 
 const PARAMS = {
@@ -601,6 +650,150 @@ describe("off-peak boost (issue #3)", () => {
     emit(b.handlers, "pac-1", "temperature", 26);
     emit(b.handlers, "weather-1", "temperature", 32);
     expect(b.orders).toEqual([]);
+    inst.stop();
+  });
+});
+
+describe("surplus arbiter (spec 140)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("grant engages precool, revoke hands back the comfort setpoint", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06"); // airing done
+    emit(b.handlers, "pac-1", "temperature", 26.5); // inside band, no auto-on
+    emit(b.handlers, "weather-1", "temperature", 33); // hot → claim held
+    expect(arb.claimed()).toBe(true);
+    expect(b.orders).toHaveLength(0); // pending, not granted → no precool
+
+    arb.grant();
+    vi.advanceTimersByTime(1); // flush the deferred re-evaluation
+    expect(b.stateMap.get("phase")).toBe("precool");
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: true },
+      { equipmentId: "pac-1", alias: "setpoint", value: 24 },
+    ]);
+
+    arb.revoke();
+    vi.advanceTimersByTime(1);
+    expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
+    expect(b.stateMap.get("phase")).toBe("cooling"); // AC stays on
+    inst.stop();
+  });
+
+  it("arbiter is the authority: raw export alone never engages without a grant", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -2000); // huge export, but no grant
+    vi.advanceTimersByTime(30 * 60_000);
+    expect(arb.claimed()).toBe(true);
+    expect(b.orders).toHaveLength(0); // deferring to the arbiter, which has not granted
+    inst.stop();
+  });
+
+  it("a denied claim (AC not profiled) falls back to raw-export detection", () => {
+    const arb = makeArbiter({ denied: true });
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500); // raw export drives the fallback
+    vi.advanceTimersByTime(16 * 60_000);
+    expect(b.stateMap.get("phase")).toBe("precool");
+    inst.stop();
+  });
+
+  it("arbiter present but disabled: raw-export fallback, no claim held", () => {
+    const arb = makeArbiter({ enabled: false });
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500);
+    vi.advanceTimersByTime(16 * 60_000);
+    expect(b.stateMap.get("phase")).toBe("precool");
+    expect(arb.claimed()).toBe(false); // never claimed while the arbiter is off
+    inst.stop();
+  });
+
+  it("stop() releases the claim", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    emit(b.handlers, "weather-1", "temperature", 33); // hot → claim held
+    expect(arb.claimed()).toBe(true);
+    inst.stop();
+    expect(arb.released()).toBe(true);
+  });
+
+  it("night cut releases the claim (no leak into night_off)", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T12:50:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, nightOffTime: "13:00" },
+      b.ctx as never,
+    );
+    emit(b.handlers, "weather-1", "temperature", 33); // hot daytime → claim held
+    expect(arb.claimed()).toBe(true);
+    vi.advanceTimersByTime(11 * 60_000); // crosses 13:00 → night cut fires
+    expect(b.stateMap.get("phase")).toBe("night_off");
+    expect(arb.released()).toBe(true);
+    inst.stop();
+  });
+
+  it("debounces claim release: a brief cool spell does not thrash the arbiter", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06"); // airing done
+    emit(b.handlers, "pac-1", "temperature", 26.5); // hot inside → wantClaim true
+    emit(b.handlers, "weather-1", "temperature", 33);
+    expect(arb.claimed()).toBe(true);
+    // No longer hot → wantClaim false, but the claim is HELD (5 min debounce).
+    emit(b.handlers, "pac-1", "temperature", 24); // tInt 24 <= comfort
+    emit(b.handlers, "weather-1", "temperature", 20); // tExt 20 < hotDay
+    vi.advanceTimersByTime(4 * 60_000); // < 5 min hold
+    expect(arb.claimed()).toBe(true); // still held
+    vi.advanceTimersByTime(2 * 60_000); // now past 5 min
+    expect(arb.claimed()).toBe(false); // released
+    inst.stop();
+  });
+
+  it("a throwing arbiter helper degrades to raw-export detection, no crash", () => {
+    const throwing = {
+      claimCapacity: () => {
+        throw new Error("boom");
+      },
+      getCapacityState: () => ({ enabled: true, availableSurplusW: 800, grants: [] }),
+    };
+    const b = makeCtx({ energy: throwing });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500); // raw export drives the fallback
+    vi.advanceTimersByTime(16 * 60_000);
+    expect(b.stateMap.get("phase")).toBe("precool"); // engaged despite the throwing arbiter
     inst.stop();
   });
 });
