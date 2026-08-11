@@ -5,9 +5,14 @@
 //  1. Morning airing (notify only): `openWindows` rises when outdoor air
 //     is bearable and still cooler than indoors; `closeWindows` rises when
 //     outdoor catches up with indoor. Map both to notifications.
-//  2. Pre-cooling: on a hot day with sustained grid export, run the AC at
-//     a lower setpoint to bank cooling with energy otherwise injected.
-//  3. Comfort: restore the normal setpoint when the surplus collapses.
+//  2. Pre-cooling: on a hot day when solar surplus is available — via the
+//     capacity arbiter when it is enabled (v1.4.0), otherwise self-detected
+//     from sustained grid export — or during the afternoon off-peak tariff
+//     window (v1.3.0, issue #3). Runs the AC at a lower setpoint to bank
+//     cooling with energy that is otherwise injected or cheap. The arbiter
+//     path degrades gracefully: no helper, arbiter off, no production, or an
+//     unprofiled AC all fall back to the grid-export self-detection.
+//  3. Comfort: restore the normal setpoint when neither signal holds.
 //  4. Night cut: switch the AC off at a fixed time (once per day).
 //
 // The recipe only issues orders on phase TRANSITIONS — a manual change
@@ -24,6 +29,31 @@ interface OrderBindingLite {
   alias: string;
   category?: string;
   type?: string;
+}
+// Spec 140 capacity-arbiter helpers, mirrored from core (recipes don't import
+// core). All optional at the call site — see the `energy?` helper below.
+interface CapacityClaimReq {
+  equipmentId: string;
+  watts?: number;
+  toleratedImportW?: number;
+  slack?: "none" | "some" | "high";
+  note?: string;
+  onGranted: () => void;
+  onRevoked: (reason: string) => void;
+}
+interface CapacityHandle {
+  id: string;
+  status(): "pending" | "granted" | "denied" | "released";
+  deniedReason?: string;
+  release(): void;
+}
+interface EnergyHelpers {
+  claimCapacity(req: CapacityClaimReq): CapacityHandle;
+  getCapacityState(): {
+    enabled: boolean;
+    availableSurplusW: number | null;
+    grants: Array<{ equipmentId: string; watts: number; sinceIso: string }>;
+  };
 }
 interface RecipeContext {
   eventBus: {
@@ -57,6 +87,18 @@ interface RecipeContext {
     parseDuration(value: unknown): number;
     formatDuration(ms: number): string;
     getSunlight?(): { sunrise: string | null; sunset: string | null; isDaylight: boolean | null };
+    // Spec 138, Sowel >= 1.37.0. Optional: on older cores the off-peak
+    // boost stays inert and everything else behaves exactly as before.
+    getTariff?(): {
+      configured: boolean;
+      offPeakToday: Array<{ start: string; end: string }>;
+      isOffPeakNow: boolean | null;
+    };
+    // Spec 140, Sowel >= 1.39.0. Optional: on older cores, when the arbiter is
+    // off, or the home has no production, this helper is absent or claimCapacity
+    // returns a denied handle, and the recipe self-detects surplus from the grid
+    // meter's export exactly as in v1.3.0.
+    energy?: EnergyHelpers;
   };
   dispatchOrder(equipmentId: string, alias: string, value: unknown): Promise<void>;
 }
@@ -120,6 +162,33 @@ export function exportWatts(gridPower: unknown): number | null {
   return Math.max(0, -gridPower);
 }
 
+/**
+ * The "pre-peak" off-peak window: the same-day slot whose end lands in the
+ * afternoon or early evening — the cheap stretch that immediately precedes
+ * the expensive evening hours, where banked cold survives into the peak.
+ *
+ * Night slots never qualify: a slot that wraps past midnight (end <= start)
+ * or ends before noon banks cold the day then wastes, and would fight the
+ * morning airing. A slot ending past `nightOffMin` is the night cut's
+ * territory. With several candidates the latest-ending one wins (closest to
+ * the peak). Returns `[startMin, endMin)` or null.
+ */
+export function prePeakOffPeakWindow(
+  slots: Array<{ start: string; end: string }>,
+  nightOffMin: number,
+): { startMin: number; endMin: number } | null {
+  let best: { startMin: number; endMin: number } | null = null;
+  for (const slot of slots) {
+    const startMin = hmToMinutes(slot.start);
+    const endMin = hmToMinutes(slot.end);
+    if (Number.isNaN(startMin) || Number.isNaN(endMin)) continue;
+    if (endMin <= startMin) continue; // wraps past midnight → night slot
+    if (endMin < 12 * 60 || endMin > nightOffMin) continue;
+    if (!best || endMin > best.endMin) best = { startMin, endMin };
+  }
+  return best;
+}
+
 const CLOCK_MS = 30_000;
 const DISENGAGE_EXPORT_W = 100;
 const DISENGAGE_HOLD_MS = 10 * 60_000;
@@ -138,7 +207,7 @@ export function createRecipe(): RecipeDefinition {
     id: "smart-cooling",
     name: "Smart Cooling",
     description:
-      "Solar-aware AC optimizer: notifies morning airing windows, pre-cools on sustained solar surplus during hot days, restores the comfort setpoint when the surplus ends, and switches the AC off at a fixed night time. Only acts on phase transitions — manual changes in between are never overridden.",
+      "Solar-aware AC optimizer: notifies morning airing windows, pre-cools on sustained solar surplus or during the afternoon off-peak tariff window on hot days, restores the comfort setpoint when neither holds, and switches the AC off at a fixed night time. Only acts on phase transitions — manual changes in between are never overridden.",
 
     slots: [
       { id: "zone", name: "Zone", description: "Zone of the AC", type: "zone", required: true },
@@ -225,6 +294,16 @@ export function createRecipe(): RecipeDefinition {
         group: "solar",
       },
       {
+        id: "tariffBoostEnabled",
+        name: "Off-peak pre-cool boost",
+        description:
+          "Also pre-cool during the afternoon off-peak window on hot days, even without solar surplus. Requires the tariff schedule to be configured (Sowel 1.37+); inert otherwise.",
+        type: "boolean",
+        required: false,
+        defaultValue: true,
+        group: "tariff",
+      },
+      {
         id: "comfortOnDelta",
         name: "Auto-on margin",
         description: "Turn the AC on when indoor exceeds the comfort setpoint by this margin (°C)",
@@ -288,7 +367,7 @@ export function createRecipe(): RecipeDefinition {
       fr: {
         name: "Clim intelligente",
         description:
-          "Optimise la climatisation avec le solaire : notifie les fenêtres d'aération le matin, pré-refroidit sur surplus solaire soutenu les jours chauds, restaure la consigne confort quand le surplus disparaît, et éteint la clim à heure fixe le soir. N'agit qu'aux transitions — vos réglages manuels entre-temps sont respectés.",
+          "Optimise la climatisation avec le solaire : notifie les fenêtres d'aération le matin, pré-refroidit sur surplus solaire soutenu ou pendant la fenêtre d'heures creuses de l'après-midi les jours chauds, restaure la consigne confort quand aucun des deux ne tient, et éteint la clim à heure fixe le soir. N'agit qu'aux transitions — vos réglages manuels entre-temps sont respectés.",
         slots: {
           zone: { name: "Zone", description: "Zone de la climatisation" },
           pac: { name: "Climatisation", description: "Équipement thermostat à piloter (marche + consigne)" },
@@ -330,6 +409,11 @@ export function createRecipe(): RecipeDefinition {
             name: "Seuil jour chaud",
             description: "Température extérieure (°C) au-delà de laquelle pré-refroidir vaut le coup",
           },
+          tariffBoostEnabled: {
+            name: "Boost heures creuses",
+            description:
+              "Pré-refroidit aussi pendant la fenêtre d'heures creuses de l'après-midi les jours chauds, même sans surplus solaire. Nécessite le tarif configuré (Sowel 1.37+) ; inactif sinon.",
+          },
           nightOffTime: { name: "Heure d'extinction", description: "La clim est éteinte à cette heure (une fois par jour)" },
           airingEnabled: {
             name: "Notifications d'aération",
@@ -347,6 +431,7 @@ export function createRecipe(): RecipeDefinition {
         groups: {
           setpoints: "Consignes",
           solar: "Surplus solaire",
+          tariff: "Heures creuses",
           night: "Nuit",
           airing: "Aération du matin",
         },
@@ -414,6 +499,7 @@ export function createRecipe(): RecipeDefinition {
       const comfortOnDelta = Number(params.comfortOnDelta ?? 1);
       const comfortOffDelta = Number(params.comfortOffDelta ?? 1);
       const nightOffMin = hmToMinutes(String(params.nightOffTime ?? "23:00"));
+      const tariffBoostEnabled = params.tariffBoostEnabled !== false;
       const airingEnabled = params.airingEnabled !== false;
       const airingMinOutdoor = Number(params.airingMinOutdoor ?? 18);
       const airingMargin = Number(params.airingMargin ?? 0.5);
@@ -470,6 +556,51 @@ export function createRecipe(): RecipeDefinition {
       const lastSeen = new Map<string, unknown>();
       let stopped = false;
 
+      // ── Surplus arbiter (spec 140) ──────────────────────────
+      // When the core exposes ctx.helpers.energy AND the arbiter is enabled,
+      // the recipe holds a claim on the AC while pre-cooling is a candidate and
+      // pre-cools on the arbiter's grant, instead of reading raw grid export.
+      // When the helper is absent, the arbiter is off, or the AC is not
+      // profiled (claim denied), `claim` is null/denied and the raw-export
+      // detection below drives pre-cooling exactly as before.
+      let claim: CapacityHandle | null = null;
+      let arbiterGranted = false;
+      let evalScheduled = false;
+      let notWantingSince: number | null = null; // debounce claim release (anti-thrash)
+      const CLAIM_RELEASE_HOLD_MS = 5 * 60_000;
+      const arbiterEnabled = (): boolean => {
+        try {
+          return !!ctx.helpers.energy && ctx.helpers.energy.getCapacityState().enabled;
+        } catch {
+          return false;
+        }
+      };
+      const releaseClaim = () => {
+        try {
+          if (claim) claim.release();
+        } catch {
+          /* a broken handle must not break the recipe */
+        }
+        claim = null;
+        arbiterGranted = false;
+        notWantingSince = null;
+      };
+      // The arbiter may invoke onGranted/onRevoked synchronously from inside
+      // claimCapacity(); defer the re-evaluation to the next tick so it never
+      // re-enters the evaluate() pass that created the claim.
+      const scheduleEvaluate = () => {
+        if (evalScheduled || stopped) return;
+        evalScheduled = true;
+        setTimeout(() => {
+          evalScheduled = false;
+          try {
+            if (!stopped) evaluate();
+          } catch (err) {
+            ctx.logger.error({ err }, "smart-cooling: deferred evaluate failed");
+          }
+        }, 0);
+      };
+
       // ── Order helper: transitions only, never throws ────────
       const sendOrder = (alias: string, value: unknown, why: string, exemptGap = false) => {
         const now = Date.now();
@@ -521,6 +652,7 @@ export function createRecipe(): RecipeDefinition {
           s.set("nightOffOn", today);
           sendOrder(powerOrderAlias, false, "night cut", true);
           setPhase("night_off");
+          releaseClaim(); // the AC is off for the night — free the reservation
           return;
         }
         if (phase === "night_off") return; // dormant until rollover
@@ -552,33 +684,107 @@ export function createRecipe(): RecipeDefinition {
           }
         }
 
-        // 3. Pre-cooling on sustained surplus, daytime, hot day. Blocked
-        // while the airing window is open (phase "airing") — cooling with
-        // the windows open would be absurd; everything else stays manual.
+        // 3. Pre-cooling on sustained surplus (daytime) or inside the
+        // afternoon off-peak window (issue #3) — both need a hot day.
+        // Blocked while the airing window is open (phase "airing") —
+        // cooling with the windows open would be absurd; everything else
+        // stays manual. The tariff snapshot is recomputed every pass: it
+        // is cheap, and it follows tariff edits and day changes on its
+        // own. Unconfigured tariff, night-only contracts and cores
+        // without getTariff() (< 1.37) all leave `inBoostWindow` false.
         const daytime = nowMin >= sunriseMin() && nowMin <= sunsetMin();
         const hot = (tExt !== null && tExt >= hotDayThreshold) || (tInt !== null && tInt > comfortSetpoint);
 
-        if (
-          phase !== "precool" &&
-          phase !== "airing" &&
-          daytime &&
-          hot &&
-          exportSince !== null &&
-          now - exportSince >= surplusHoldMs
-        ) {
-          if (sendOrder(powerOrderAlias, true, "precool engage")) {
+        let inBoostWindow = false;
+        if (tariffBoostEnabled && hot) {
+          try {
+            const tariff = ctx.helpers.getTariff?.();
+            if (tariff?.configured && Array.isArray(tariff.offPeakToday)) {
+              const win = prePeakOffPeakWindow(tariff.offPeakToday, nightOffMin);
+              inBoostWindow = win !== null && nowMin >= win.startMin && nowMin < win.endMin;
+            }
+          } catch (err) {
+            ctx.logger.error({ err }, "smart-cooling: getTariff failed");
+          }
+        }
+
+        // Surplus signal: defer to the arbiter when it manages this AC,
+        // otherwise self-detect from sustained grid export (v1.3.0 fallback).
+        const rawSurplusReady = daytime && exportSince !== null && now - exportSince >= surplusHoldMs;
+
+        // Hold a claim on the AC while pre-cooling is a candidate (hot, daytime,
+        // not airing/night); the arbiter grants when real surplus exists.
+        const wantClaim =
+          arbiterEnabled() && hot && daytime && phase !== "airing" && phase !== "night_off";
+        if (wantClaim) {
+          notWantingSince = null;
+          if (!claim && ctx.helpers.energy) {
+            try {
+              claim =
+                ctx.helpers.energy.claimCapacity({
+                  equipmentId: pacId,
+                  toleratedImportW: 0,
+                  slack: "some",
+                  note: "precool boost",
+                  onGranted: () => {
+                    arbiterGranted = true;
+                    scheduleEvaluate();
+                  },
+                  onRevoked: () => {
+                    arbiterGranted = false;
+                    scheduleEvaluate();
+                  },
+                }) ?? null;
+            } catch (err) {
+              ctx.logger.error({ err }, "smart-cooling: claimCapacity failed");
+              claim = null;
+              arbiterGranted = false; // a sync onGranted-then-throw must not leave a stale grant
+            }
+          }
+        } else if (claim) {
+          // Debounced release: a brief dip below `hot` must not thrash the
+          // arbiter with rapid claim/release churn.
+          notWantingSince ??= now;
+          if (now - notWantingSince >= CLAIM_RELEASE_HOLD_MS) releaseClaim();
+        }
+        // The arbiter manages this AC only if the claim exists and was not
+        // denied (e.g. the AC carries no energy profile); otherwise fall back.
+        let arbiterManaging = false;
+        if (claim) {
+          try {
+            arbiterManaging = claim.status() !== "denied";
+          } catch {
+            arbiterManaging = false;
+          }
+        }
+        const surplusReady = arbiterManaging ? arbiterGranted : rawSurplusReady;
+
+        if (phase !== "precool" && phase !== "airing" && hot && (surplusReady || inBoostWindow)) {
+          if (
+            sendOrder(
+              powerOrderAlias,
+              true,
+              surplusReady ? "precool engage (surplus)" : "precool engage (off-peak)",
+            )
+          ) {
             sendOrder(setpointOrderAlias, precoolSetpoint, "precool setpoint", true);
             setPhase("precool");
           }
           return;
         }
 
-        // 4. Pre-cool exit: surplus collapsed → back to the comfort setpoint.
-        // The AC stays ON (phase "cooling") — the auto-off rule below takes
-        // over: with a pre-cooled house it releases quickly and the house
-        // coasts on the banked cold.
-        if (phase === "precool" && lowExportSince !== null && now - lowExportSince >= DISENGAGE_HOLD_MS) {
-          sendOrder(setpointOrderAlias, comfortSetpoint, "surplus over, comfort setpoint", true);
+        // 4. Pre-cool exit: surplus collapsed AND no off-peak window
+        // holding → back to the comfort setpoint. The AC stays ON (phase
+        // "cooling") — the auto-off rule below takes over: with a
+        // pre-cooled house it releases quickly and the house coasts on
+        // the banked cold. A boost engaged with zero surplus has had
+        // `lowExportSince` running since engage, so the window end alone
+        // releases it.
+        const surplusGone = arbiterManaging
+          ? !arbiterGranted
+          : lowExportSince !== null && now - lowExportSince >= DISENGAGE_HOLD_MS;
+        if (phase === "precool" && !inBoostWindow && surplusGone) {
+          sendOrder(setpointOrderAlias, comfortSetpoint, "precool over, comfort setpoint", true);
           setPhase("cooling");
         }
 
@@ -658,8 +864,19 @@ export function createRecipe(): RecipeDefinition {
         }
       }, CLOCK_MS);
 
+      if (tariffBoostEnabled && !ctx.helpers.getTariff) {
+        ctx.log(
+          "Off-peak pre-cool boost is enabled but this Sowel core has no getTariff() helper (needs 1.37+) — boost inactive, surplus behavior unchanged",
+          "warn",
+        );
+      }
       ctx.log(
-        `Smart Cooling started (comfort=${comfortSetpoint}°C, precool=${precoolSetpoint}°C, surplus≥${surplusThreshold}W for ${ctx.helpers.formatDuration(surplusHoldMs)}, night off ${String(params.nightOffTime ?? "23:00")})`,
+        `Smart Cooling started (comfort=${comfortSetpoint}°C, precool=${precoolSetpoint}°C, surplus≥${surplusThreshold}W for ${ctx.helpers.formatDuration(surplusHoldMs)}, off-peak boost ${tariffBoostEnabled ? "on" : "off"}, night off ${String(params.nightOffTime ?? "23:00")})`,
+      );
+      ctx.log(
+        ctx.helpers.energy
+          ? "Surplus arbiter available. Pre-cooling follows its grants when enabled; grid-export self-detection is the fallback."
+          : "No surplus arbiter on this core (needs Sowel 1.39+). Self-detecting surplus from grid export.",
       );
 
       return {
@@ -667,6 +884,7 @@ export function createRecipe(): RecipeDefinition {
           stopped = true;
           clearInterval(clock);
           unsub();
+          releaseClaim();
         },
       };
     },
