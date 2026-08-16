@@ -57,7 +57,10 @@ interface EnergyHelpers {
 }
 interface RecipeContext {
   eventBus: {
-    onType(type: string, handler: (event: Record<string, unknown>) => void): () => void;
+    onType(
+      type: string,
+      handler: (event: Record<string, unknown>) => void,
+    ): () => void;
   };
   equipmentManager: {
     getByIdWithDetails(id: string): {
@@ -86,7 +89,11 @@ interface RecipeContext {
   helpers: {
     parseDuration(value: unknown): number;
     formatDuration(ms: number): string;
-    getSunlight?(): { sunrise: string | null; sunset: string | null; isDaylight: boolean | null };
+    getSunlight?(): {
+      sunrise: string | null;
+      sunset: string | null;
+      isDaylight: boolean | null;
+    };
     // Spec 138, Sowel >= 1.37.0. Optional: on older cores the off-peak
     // boost stays inert and everything else behaves exactly as before.
     getTariff?(): {
@@ -100,14 +107,26 @@ interface RecipeContext {
     // meter's export exactly as in v1.3.0.
     energy?: EnergyHelpers;
   };
-  dispatchOrder(equipmentId: string, alias: string, value: unknown): Promise<void>;
+  dispatchOrder(
+    equipmentId: string,
+    alias: string,
+    value: unknown,
+  ): Promise<void>;
 }
 
 interface RecipeSlotDef {
   id: string;
   name: string;
   description: string;
-  type: "zone" | "equipment" | "number" | "duration" | "time" | "boolean" | "text" | "data-key";
+  type:
+    | "zone"
+    | "equipment"
+    | "number"
+    | "duration"
+    | "time"
+    | "boolean"
+    | "text"
+    | "data-key";
   required: boolean;
   list?: boolean;
   defaultValue?: unknown;
@@ -134,7 +153,10 @@ interface RecipeDefinition {
   slots: RecipeSlotDef[];
   i18n?: Record<string, RecipeLangPack>;
   validate(params: Record<string, unknown>, ctx: RecipeContext): void;
-  createInstance(params: Record<string, unknown>, ctx: RecipeContext): { stop(): void };
+  createInstance(
+    params: Record<string, unknown>,
+    ctx: RecipeContext,
+  ): { stop(): void };
 }
 
 // ============================================================
@@ -193,6 +215,17 @@ const CLOCK_MS = 30_000;
 const DISENGAGE_EXPORT_W = 100;
 const DISENGAGE_HOLD_MS = 10 * 60_000;
 const MIN_ORDER_GAP_MS = 10 * 60_000;
+// v2.0 surplus-proportional pre-cooling. Instead of slamming a fixed setpoint,
+// the pre-cool setpoint is walked toward the grid balance: one ±SETPOINT_STEP_C
+// step every PRECOOL_WALK_MS, held inside a ±SURPLUS_DEADBAND_W band, bounded by
+// [precoolFloor, comfort]. Exporting past the band pushes the setpoint down (draw
+// more), importing past it eases up. The cadence is shorter than the arbiter's
+// deficit hold, so the recipe backs off an over-import before the arbiter revokes.
+// This turns the inverter AC into a solar sink that tracks the available surplus,
+// rather than an on/off load that needs a full surplus to ever engage.
+const SETPOINT_STEP_C = 0.5;
+const PRECOOL_WALK_MS = 5 * 60_000;
+const SURPLUS_DEADBAND_W = 150;
 // The "open the windows" suggestion is a MORNING thing: without this bound,
 // any cool evening (T_ext dropping back below T_int, i.e. every day) would
 // fire it at dinner time on days when the morning window never opened.
@@ -210,7 +243,13 @@ export function createRecipe(): RecipeDefinition {
       "Solar-aware AC optimizer: notifies morning airing windows, pre-cools on sustained solar surplus or during the afternoon off-peak tariff window on hot days, restores the comfort setpoint when neither holds, and switches the AC off at a fixed night time. Only acts on phase transitions — manual changes in between are never overridden.",
 
     slots: [
-      { id: "zone", name: "Zone", description: "Zone of the AC", type: "zone", required: true },
+      {
+        id: "zone",
+        name: "Zone",
+        description: "Zone of the AC",
+        type: "zone",
+        required: true,
+      },
       {
         id: "pac",
         name: "Air conditioner",
@@ -230,7 +269,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "weather",
         name: "Outdoor temperature",
-        description: "Equipment providing the outdoor temperature (e.g. a weather station)",
+        description:
+          "Equipment providing the outdoor temperature (e.g. a weather station)",
         type: "equipment",
         required: true,
         constraints: { equipmentType: "weather", crossZone: true },
@@ -242,7 +282,10 @@ export function createRecipe(): RecipeDefinition {
           "Equipment providing the indoor temperature. Leave empty to use the AC's own sensor — but a continuously-reporting sensor (e.g. a weather station indoor module) is strongly recommended: an AC's built-in probe freezes its last value while the unit is off, which misleads the morning airing and the auto on/off.",
         type: "equipment",
         required: false,
-        constraints: { equipmentType: ["weather", "sensor", "thermostat"], crossZone: true },
+        constraints: {
+          equipmentType: ["weather", "sensor", "thermostat"],
+          crossZone: true,
+        },
       },
       {
         id: "comfortSetpoint",
@@ -255,12 +298,13 @@ export function createRecipe(): RecipeDefinition {
         group: "setpoints",
       },
       {
-        id: "precoolSetpoint",
-        name: "Pre-cool setpoint",
-        description: "Lower setpoint used while solar surplus is available (°C)",
+        id: "precoolFloor",
+        name: "Pre-cool floor",
+        description:
+          "Lowest setpoint reached at full surplus (°C). While surplus is available the setpoint glides between this floor and the comfort setpoint to track it. Replaces the former fixed pre-cool setpoint.",
         type: "number",
         required: false,
-        defaultValue: 24,
+        defaultValue: 22,
         constraints: { min: 18, max: 28 },
         group: "setpoints",
       },
@@ -277,7 +321,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "surplusHold",
         name: "Surplus hold",
-        description: "How long the export must be sustained before pre-cooling (e.g. 15m)",
+        description:
+          "How long the export must be sustained before pre-cooling (e.g. 15m)",
         type: "duration",
         required: false,
         defaultValue: "15m",
@@ -286,7 +331,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "hotDayThreshold",
         name: "Hot day threshold",
-        description: "Outdoor temperature (°C) beyond which pre-cooling is worth it",
+        description:
+          "Outdoor temperature (°C) beyond which pre-cooling is worth it",
         type: "number",
         required: false,
         defaultValue: 30,
@@ -306,7 +352,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "comfortOnDelta",
         name: "Auto-on margin",
-        description: "Turn the AC on when indoor exceeds the comfort setpoint by this margin (°C)",
+        description:
+          "Turn the AC on when indoor exceeds the comfort setpoint by this margin (°C)",
         type: "number",
         required: false,
         defaultValue: 1,
@@ -316,7 +363,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "comfortOffDelta",
         name: "Auto-off margin",
-        description: "Turn the AC off when indoor falls below the comfort setpoint by this margin (°C)",
+        description:
+          "Turn the AC off when indoor falls below the comfort setpoint by this margin (°C)",
         type: "number",
         required: false,
         defaultValue: 1,
@@ -344,7 +392,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "airingMinOutdoor",
         name: "Airing minimum outdoor",
-        description: "Suggest opening only when the outdoor temperature is at least this (°C)",
+        description:
+          "Suggest opening only when the outdoor temperature is at least this (°C)",
         type: "number",
         required: false,
         defaultValue: 18,
@@ -354,7 +403,8 @@ export function createRecipe(): RecipeDefinition {
       {
         id: "airingMargin",
         name: "Airing close margin",
-        description: "Suggest closing when outdoor reaches indoor minus this margin (°C)",
+        description:
+          "Suggest closing when outdoor reaches indoor minus this margin (°C)",
         type: "number",
         required: false,
         defaultValue: 0.5,
@@ -370,62 +420,83 @@ export function createRecipe(): RecipeDefinition {
           "Optimise la climatisation avec le solaire : notifie les fenêtres d'aération le matin, pré-refroidit sur surplus solaire soutenu ou pendant la fenêtre d'heures creuses de l'après-midi les jours chauds, restaure la consigne confort quand aucun des deux ne tient, et éteint la clim à heure fixe le soir. N'agit qu'aux transitions — vos réglages manuels entre-temps sont respectés.",
         slots: {
           zone: { name: "Zone", description: "Zone de la climatisation" },
-          pac: { name: "Climatisation", description: "Équipement thermostat à piloter (marche + consigne)" },
+          pac: {
+            name: "Climatisation",
+            description: "Équipement thermostat à piloter (marche + consigne)",
+          },
           gridMeter: {
             name: "Compteur principal",
-            description: "Compteur principal avec puissance signée (+soutirage / −injection)",
+            description:
+              "Compteur principal avec puissance signée (+soutirage / −injection)",
           },
           weather: {
             name: "Température extérieure",
-            description: "Équipement fournissant la température extérieure (ex. une station météo)",
+            description:
+              "Équipement fournissant la température extérieure (ex. une station météo)",
           },
           indoorSensor: {
             name: "Température intérieure",
             description:
               "Équipement fournissant la température intérieure. Vide = capteur interne de la clim, mais un capteur qui remonte en continu (ex. module intérieur d'une station météo) est fortement recommandé : la sonde interne d'une clim fige sa dernière valeur quand l'unité est éteinte, ce qui trompe l'aération du matin et l'allumage/extinction auto.",
           },
-          comfortSetpoint: { name: "Consigne confort", description: "Consigne normale de refroidissement (°C)" },
+          comfortSetpoint: {
+            name: "Consigne confort",
+            description: "Consigne normale de refroidissement (°C)",
+          },
           comfortOnDelta: {
             name: "Marge d'allumage auto",
-            description: "Allume la clim quand l'intérieur dépasse la consigne confort de cette marge (°C)",
+            description:
+              "Allume la clim quand l'intérieur dépasse la consigne confort de cette marge (°C)",
           },
           comfortOffDelta: {
             name: "Marge d'extinction auto",
-            description: "Éteint la clim quand l'intérieur descend sous la consigne confort de cette marge (°C)",
+            description:
+              "Éteint la clim quand l'intérieur descend sous la consigne confort de cette marge (°C)",
           },
-          precoolSetpoint: {
-            name: "Consigne pré-refroidissement",
-            description: "Consigne abaissée pendant le surplus solaire (°C)",
+          precoolFloor: {
+            name: "Plancher de pré-refroidissement",
+            description:
+              "Consigne la plus basse atteinte à plein surplus (°C). Tant qu'il y a du surplus, la consigne glisse entre ce plancher et la consigne confort pour le suivre. Remplace l'ancienne consigne fixe de pré-refroidissement.",
           },
           surplusThreshold: {
             name: "Seuil de surplus",
-            description: "Injection réseau (W) considérée comme surplus utilisable",
+            description:
+              "Injection réseau (W) considérée comme surplus utilisable",
           },
           surplusHold: {
             name: "Durée de surplus",
-            description: "Durée d'injection soutenue avant pré-refroidissement (ex. 15m)",
+            description:
+              "Durée d'injection soutenue avant pré-refroidissement (ex. 15m)",
           },
           hotDayThreshold: {
             name: "Seuil jour chaud",
-            description: "Température extérieure (°C) au-delà de laquelle pré-refroidir vaut le coup",
+            description:
+              "Température extérieure (°C) au-delà de laquelle pré-refroidir vaut le coup",
           },
           tariffBoostEnabled: {
             name: "Boost heures creuses",
             description:
               "Pré-refroidit aussi pendant la fenêtre d'heures creuses de l'après-midi les jours chauds, même sans surplus solaire. Nécessite le tarif configuré (Sowel 1.37+) ; inactif sinon.",
           },
-          nightOffTime: { name: "Heure d'extinction", description: "La clim est éteinte à cette heure (une fois par jour)" },
+          nightOffTime: {
+            name: "Heure d'extinction",
+            description:
+              "La clim est éteinte à cette heure (une fois par jour)",
+          },
           airingEnabled: {
             name: "Notifications d'aération",
-            description: "Notifier quand ouvrir et fermer les fenêtres le matin",
+            description:
+              "Notifier quand ouvrir et fermer les fenêtres le matin",
           },
           airingMinOutdoor: {
             name: "Minimum extérieur d'aération",
-            description: "Ne suggérer d'ouvrir que si la température extérieure atteint au moins ce seuil (°C)",
+            description:
+              "Ne suggérer d'ouvrir que si la température extérieure atteint au moins ce seuil (°C)",
           },
           airingMargin: {
             name: "Marge de fermeture",
-            description: "Suggérer de fermer quand l'extérieur atteint l'intérieur moins cette marge (°C)",
+            description:
+              "Suggérer de fermer quand l'extérieur atteint l'intérieur moins cette marge (°C)",
           },
         },
         groups: {
@@ -457,20 +528,28 @@ export function createRecipe(): RecipeDefinition {
         }
       }
       const comfort = Number(params.comfortSetpoint ?? 26);
-      const precool = Number(params.precoolSetpoint ?? 24);
-      if (Number.isNaN(comfort) || Number.isNaN(precool)) {
+      // v2.0 renamed precoolSetpoint → precoolFloor; still accept the old key
+      // as a fallback so existing instances keep their configured value.
+      const floor = Number(params.precoolFloor ?? params.precoolSetpoint ?? 22);
+      if (Number.isNaN(comfort) || Number.isNaN(floor)) {
         throw new Error("Setpoints must be numbers");
       }
-      if (precool > comfort) {
-        throw new Error("Pre-cool setpoint must be lower than or equal to the comfort setpoint");
+      if (floor > comfort) {
+        throw new Error(
+          "Pre-cool floor must be lower than or equal to the comfort setpoint",
+        );
       }
       const nightOff = String(params.nightOffTime ?? "23:00");
       if (Number.isNaN(hmToMinutes(nightOff))) {
         throw new Error("nightOffTime must be HH:MM");
       }
       const pac = ctx.equipmentManager.getByIdWithDetails(params.pac as string);
-      const hasPower = pac?.orderBindings.some((o) => o.category === "toggle_power" || o.alias === "power");
-      const hasSetpoint = pac?.orderBindings.some((o) => o.category === "set_setpoint" || o.alias === "setpoint");
+      const hasPower = pac?.orderBindings.some(
+        (o) => o.category === "toggle_power" || o.alias === "power",
+      );
+      const hasSetpoint = pac?.orderBindings.some(
+        (o) => o.category === "set_setpoint" || o.alias === "setpoint",
+      );
       if (!hasPower || !hasSetpoint) {
         throw new Error("AC equipment must expose power and setpoint orders");
       }
@@ -492,9 +571,15 @@ export function createRecipe(): RecipeDefinition {
           ? params.indoorSensor
           : pacId;
       const comfortSetpoint = Number(params.comfortSetpoint ?? 26);
-      const precoolSetpoint = Number(params.precoolSetpoint ?? 24);
+      // v2.0: the fixed precool setpoint became a floor the setpoint glides down
+      // to; the old key is still honoured for existing instances.
+      const precoolFloor = Number(
+        params.precoolFloor ?? params.precoolSetpoint ?? 22,
+      );
       const surplusThreshold = Number(params.surplusThreshold ?? 500);
-      const surplusHoldMs = ctx.helpers.parseDuration(params.surplusHold ?? "15m");
+      const surplusHoldMs = ctx.helpers.parseDuration(
+        params.surplusHold ?? "15m",
+      );
       const hotDayThreshold = Number(params.hotDayThreshold ?? 30);
       const comfortOnDelta = Number(params.comfortOnDelta ?? 1);
       const comfortOffDelta = Number(params.comfortOffDelta ?? 1);
@@ -508,35 +593,48 @@ export function createRecipe(): RecipeDefinition {
       const pacEq = ctx.equipmentManager.getByIdWithDetails(pacId);
       const gridEq = ctx.equipmentManager.getByIdWithDetails(gridId);
       const weatherEq = ctx.equipmentManager.getByIdWithDetails(weatherId);
-      const indoorEq = ctx.equipmentManager.getByIdWithDetails(indoorId) ?? pacEq;
+      const indoorEq =
+        ctx.equipmentManager.getByIdWithDetails(indoorId) ?? pacEq;
 
       const gridPowerAlias =
         gridEq?.dataBindings.find((b) => b.category === "power")?.alias ??
         gridEq?.dataBindings.find((b) => b.alias === "power")?.alias ??
         "power";
       const tExtAlias =
-        weatherEq?.dataBindings.find((b) => b.category === "temperature_outdoor")?.alias ??
+        weatherEq?.dataBindings.find(
+          (b) => b.category === "temperature_outdoor",
+        )?.alias ??
         weatherEq?.dataBindings.find((b) => b.alias === "temperature")?.alias ??
         "temperature";
       const tIntAlias =
-        indoorEq?.dataBindings.find((b) => b.category === "temperature")?.alias ??
+        indoorEq?.dataBindings.find((b) => b.category === "temperature")
+          ?.alias ??
         indoorEq?.dataBindings.find((b) => b.alias === "temperature")?.alias ??
         "temperature";
       const powerOrderAlias =
-        pacEq?.orderBindings.find((o) => o.category === "toggle_power")?.alias ?? "power";
+        pacEq?.orderBindings.find((o) => o.category === "toggle_power")
+          ?.alias ?? "power";
       const setpointOrderAlias =
-        pacEq?.orderBindings.find((o) => o.category === "set_setpoint")?.alias ?? "setpoint";
+        pacEq?.orderBindings.find((o) => o.category === "set_setpoint")
+          ?.alias ?? "setpoint";
 
       // ── Live values (seeded from current bindings) ──────────
       const num = (v: unknown): number | null =>
         typeof v === "number" && Number.isFinite(v) ? v : null;
-      let gridPower = num(gridEq?.dataBindings.find((b) => b.alias === gridPowerAlias)?.value);
-      let tExt = num(weatherEq?.dataBindings.find((b) => b.alias === tExtAlias)?.value);
-      let tInt = num(indoorEq?.dataBindings.find((b) => b.alias === tIntAlias)?.value);
+      let gridPower = num(
+        gridEq?.dataBindings.find((b) => b.alias === gridPowerAlias)?.value,
+      );
+      let tExt = num(
+        weatherEq?.dataBindings.find((b) => b.alias === tExtAlias)?.value,
+      );
+      let tInt = num(
+        indoorEq?.dataBindings.find((b) => b.alias === tIntAlias)?.value,
+      );
 
       // ── Persisted daily latches / phase ─────────────────────
       const s = ctx.state;
-      const str = (k: string): string | null => (typeof s.get(k) === "string" ? (s.get(k) as string) : null);
+      const str = (k: string): string | null =>
+        typeof s.get(k) === "string" ? (s.get(k) as string) : null;
       let phase = str("phase") ?? "idle";
       const setPhase = (p: string) => {
         if (p !== phase) {
@@ -546,8 +644,10 @@ export function createRecipe(): RecipeDefinition {
         }
       };
       if (!str("phase")) s.set("phase", phase);
-      if (typeof s.get("openWindows") !== "boolean") s.set("openWindows", false);
-      if (typeof s.get("closeWindows") !== "boolean") s.set("closeWindows", false);
+      if (typeof s.get("openWindows") !== "boolean")
+        s.set("openWindows", false);
+      if (typeof s.get("closeWindows") !== "boolean")
+        s.set("closeWindows", false);
 
       // In-memory accounting
       let exportSince: number | null = null;
@@ -555,6 +655,14 @@ export function createRecipe(): RecipeDefinition {
       let lastOrderAt = 0;
       const lastSeen = new Map<string, unknown>();
       let stopped = false;
+
+      // v2.0 proportional pre-cool state: the setpoint the controller currently
+      // holds (null when not pre-cooling), when it was last moved (walk cadence),
+      // and whether this pre-cool episode is surplus-driven (walked) or an
+      // off-peak boost (fixed at the floor, no grid to track).
+      let precoolTarget: number | null = null;
+      let lastSetpointOrderAt = 0;
+      let precoolBySurplus = false;
 
       // ── Surplus arbiter (spec 140) ──────────────────────────
       // When the core exposes ctx.helpers.energy AND the arbiter is enabled,
@@ -570,7 +678,10 @@ export function createRecipe(): RecipeDefinition {
       const CLAIM_RELEASE_HOLD_MS = 5 * 60_000;
       const arbiterEnabled = (): boolean => {
         try {
-          return !!ctx.helpers.energy && ctx.helpers.energy.getCapacityState().enabled;
+          return (
+            !!ctx.helpers.energy &&
+            ctx.helpers.energy.getCapacityState().enabled
+          );
         } catch {
           return false;
         }
@@ -596,19 +707,30 @@ export function createRecipe(): RecipeDefinition {
           try {
             if (!stopped) evaluate();
           } catch (err) {
-            ctx.logger.error({ err }, "smart-cooling: deferred evaluate failed");
+            ctx.logger.error(
+              { err },
+              "smart-cooling: deferred evaluate failed",
+            );
           }
         }, 0);
       };
 
       // ── Order helper: transitions only, never throws ────────
-      const sendOrder = (alias: string, value: unknown, why: string, exemptGap = false) => {
+      const sendOrder = (
+        alias: string,
+        value: unknown,
+        why: string,
+        exemptGap = false,
+      ) => {
         const now = Date.now();
         if (!exemptGap && now - lastOrderAt < MIN_ORDER_GAP_MS) return false;
         lastOrderAt = now;
         ctx.log(`Order ${alias}=${String(value)} (${why})`);
         ctx.dispatchOrder(pacId, alias, value).catch((err: unknown) => {
-          ctx.log(`Order ${alias} failed: ${err instanceof Error ? err.message : String(err)}`, "warn");
+          ctx.log(
+            `Order ${alias} failed: ${err instanceof Error ? err.message : String(err)}`,
+            "warn",
+          );
         });
         return true;
       };
@@ -658,7 +780,12 @@ export function createRecipe(): RecipeDefinition {
         if (phase === "night_off") return; // dormant until rollover
 
         // 2. Morning airing notifications (notify only, once per day each)
-        if (airingEnabled && tExt !== null && tInt !== null && nowMin >= sunriseMin()) {
+        if (
+          airingEnabled &&
+          tExt !== null &&
+          tInt !== null &&
+          nowMin >= sunriseMin()
+        ) {
           if (
             str("openWindowsOn") !== today &&
             str("closeWindowsOn") !== today &&
@@ -680,7 +807,9 @@ export function createRecipe(): RecipeDefinition {
             s.set("openWindows", false); // silent fall (boolean mappings notify on rise only)
             s.set("closeWindows", true);
             setPhase("comfort");
-            ctx.log(`Airing window closed (T_ext=${tExt} caught up with T_int=${tInt})`);
+            ctx.log(
+              `Airing window closed (T_ext=${tExt} caught up with T_int=${tInt})`,
+            );
           }
         }
 
@@ -693,15 +822,21 @@ export function createRecipe(): RecipeDefinition {
         // own. Unconfigured tariff, night-only contracts and cores
         // without getTariff() (< 1.37) all leave `inBoostWindow` false.
         const daytime = nowMin >= sunriseMin() && nowMin <= sunsetMin();
-        const hot = (tExt !== null && tExt >= hotDayThreshold) || (tInt !== null && tInt > comfortSetpoint);
+        const hot =
+          (tExt !== null && tExt >= hotDayThreshold) ||
+          (tInt !== null && tInt > comfortSetpoint);
 
         let inBoostWindow = false;
         if (tariffBoostEnabled && hot) {
           try {
             const tariff = ctx.helpers.getTariff?.();
             if (tariff?.configured && Array.isArray(tariff.offPeakToday)) {
-              const win = prePeakOffPeakWindow(tariff.offPeakToday, nightOffMin);
-              inBoostWindow = win !== null && nowMin >= win.startMin && nowMin < win.endMin;
+              const win = prePeakOffPeakWindow(
+                tariff.offPeakToday,
+                nightOffMin,
+              );
+              inBoostWindow =
+                win !== null && nowMin >= win.startMin && nowMin < win.endMin;
             }
           } catch (err) {
             ctx.logger.error({ err }, "smart-cooling: getTariff failed");
@@ -710,12 +845,17 @@ export function createRecipe(): RecipeDefinition {
 
         // Surplus signal: defer to the arbiter when it manages this AC,
         // otherwise self-detect from sustained grid export (v1.3.0 fallback).
-        const rawSurplusReady = daytime && exportSince !== null && now - exportSince >= surplusHoldMs;
+        const rawSurplusReady =
+          daytime && exportSince !== null && now - exportSince >= surplusHoldMs;
 
         // Hold a claim on the AC while pre-cooling is a candidate (hot, daytime,
         // not airing/night); the arbiter grants when real surplus exists.
         const wantClaim =
-          arbiterEnabled() && hot && daytime && phase !== "airing" && phase !== "night_off";
+          arbiterEnabled() &&
+          hot &&
+          daytime &&
+          phase !== "airing" &&
+          phase !== "night_off";
         if (wantClaim) {
           notWantingSince = null;
           if (!claim && ctx.helpers.energy) {
@@ -723,7 +863,10 @@ export function createRecipe(): RecipeDefinition {
               claim =
                 ctx.helpers.energy.claimCapacity({
                   equipmentId: pacId,
-                  toleratedImportW: 0,
+                  // Tolerance now comes from the PAC equipment's energyProfile
+                  // (core #550): set "Import toléré (W)" on the AC to let it
+                  // engage on a partial surplus. Omitting it here = the profile
+                  // value (0 = only full surplus, the previous behaviour).
                   slack: "some",
                   note: "precool boost",
                   onGranted: () => {
@@ -759,15 +902,35 @@ export function createRecipe(): RecipeDefinition {
         }
         const surplusReady = arbiterManaging ? arbiterGranted : rawSurplusReady;
 
-        if (phase !== "precool" && phase !== "airing" && hot && (surplusReady || inBoostWindow)) {
+        if (
+          phase !== "precool" &&
+          phase !== "airing" &&
+          hot &&
+          (surplusReady || inBoostWindow)
+        ) {
           if (
             sendOrder(
               powerOrderAlias,
               true,
-              surplusReady ? "precool engage (surplus)" : "precool engage (off-peak)",
+              surplusReady
+                ? "precool engage (surplus)"
+                : "precool engage (off-peak)",
             )
           ) {
-            sendOrder(setpointOrderAlias, precoolSetpoint, "precool setpoint", true);
+            precoolBySurplus = surplusReady;
+            // Surplus: start one step below comfort and let the walk track the
+            // export down toward the floor (a gentle solar sink, not a slam).
+            // Off-peak boost: no grid to track, sit at the floor to bank cheap kWh.
+            precoolTarget = surplusReady
+              ? Math.max(precoolFloor, comfortSetpoint - SETPOINT_STEP_C)
+              : precoolFloor;
+            lastSetpointOrderAt = now;
+            sendOrder(
+              setpointOrderAlias,
+              precoolTarget,
+              "precool engage setpoint",
+              true,
+            );
             setPhase("precool");
           }
           return;
@@ -782,10 +945,54 @@ export function createRecipe(): RecipeDefinition {
         // releases it.
         const surplusGone = arbiterManaging
           ? !arbiterGranted
-          : lowExportSince !== null && now - lowExportSince >= DISENGAGE_HOLD_MS;
+          : lowExportSince !== null &&
+            now - lowExportSince >= DISENGAGE_HOLD_MS;
         if (phase === "precool" && !inBoostWindow && surplusGone) {
-          sendOrder(setpointOrderAlias, comfortSetpoint, "precool over, comfort setpoint", true);
+          sendOrder(
+            setpointOrderAlias,
+            comfortSetpoint,
+            "precool over, comfort setpoint",
+            true,
+          );
+          precoolTarget = null;
+          precoolBySurplus = false;
           setPhase("cooling");
+        }
+
+        // 4b. Proportional walk (v2.0): while pre-cooling on surplus, glide the
+        // setpoint toward the grid balance — down while exporting past the band
+        // (draw more of the surplus), up while importing past it (ease off) —
+        // one step per PRECOOL_WALK_MS, bounded [precoolFloor, comfort]. The
+        // arbiter, which knows the equipment's import tolerance, still governs
+        // whether the grant holds; this only shapes the draw within it. An
+        // off-peak boost (no surplus) is not walked — it sits at the floor.
+        if (
+          phase === "precool" &&
+          precoolBySurplus &&
+          precoolTarget !== null &&
+          gridPower !== null &&
+          now - lastSetpointOrderAt >= PRECOOL_WALK_MS
+        ) {
+          const importW = Math.max(0, gridPower);
+          const exportW = Math.max(0, -gridPower);
+          let next = precoolTarget;
+          if (importW > SURPLUS_DEADBAND_W && precoolTarget < comfortSetpoint) {
+            next = Math.min(comfortSetpoint, precoolTarget + SETPOINT_STEP_C); // ease off
+          } else if (
+            exportW > SURPLUS_DEADBAND_W &&
+            precoolTarget > precoolFloor
+          ) {
+            next = Math.max(precoolFloor, precoolTarget - SETPOINT_STEP_C); // draw more
+          }
+          if (next !== precoolTarget) {
+            const why =
+              next < precoolTarget
+                ? "precool track down (export)"
+                : "precool track up (import)";
+            precoolTarget = next;
+            lastSetpointOrderAt = now;
+            sendOrder(setpointOrderAlias, next, why, true);
+          }
         }
 
         // 5. Comfort auto-on: house too warm → AC ON at the comfort setpoint,
@@ -802,7 +1009,12 @@ export function createRecipe(): RecipeDefinition {
           tInt >= comfortSetpoint + comfortOnDelta
         ) {
           if (sendOrder(powerOrderAlias, true, "comfort auto-on")) {
-            sendOrder(setpointOrderAlias, comfortSetpoint, "comfort setpoint", true);
+            sendOrder(
+              setpointOrderAlias,
+              comfortSetpoint,
+              "comfort setpoint",
+              true,
+            );
             setPhase("cooling");
           }
           return;
@@ -871,7 +1083,7 @@ export function createRecipe(): RecipeDefinition {
         );
       }
       ctx.log(
-        `Smart Cooling started (comfort=${comfortSetpoint}°C, precool=${precoolSetpoint}°C, surplus≥${surplusThreshold}W for ${ctx.helpers.formatDuration(surplusHoldMs)}, off-peak boost ${tariffBoostEnabled ? "on" : "off"}, night off ${String(params.nightOffTime ?? "23:00")})`,
+        `Smart Cooling started (comfort=${comfortSetpoint}°C, precool floor=${precoolFloor}°C, surplus≥${surplusThreshold}W for ${ctx.helpers.formatDuration(surplusHoldMs)}, off-peak boost ${tariffBoostEnabled ? "on" : "off"}, night off ${String(params.nightOffTime ?? "23:00")})`,
       );
       ctx.log(
         ctx.helpers.energy

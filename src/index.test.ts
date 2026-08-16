@@ -1,5 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { createRecipe, hmToMinutes, exportWatts, localDay, prePeakOffPeakWindow } from "./index.js";
+import {
+  createRecipe,
+  hmToMinutes,
+  exportWatts,
+  localDay,
+  prePeakOffPeakWindow,
+} from "./index.js";
 
 // ============================================================
 // Test harness — fake RecipeContext
@@ -24,11 +30,15 @@ function makeCtx(overrides?: {
 }) {
   const handlers: Handler[] = [];
   const stateMap = new Map<string, unknown>();
-  const orders: Array<{ equipmentId: string; alias: string; value: unknown }> = [];
+  const orders: Array<{ equipmentId: string; alias: string; value: unknown }> =
+    [];
   const logs: string[] = [];
   const tariffOverride = overrides?.tariff;
 
-  const equipments: Record<string, { name: string; dataBindings: unknown[]; orderBindings: unknown[] }> = {
+  const equipments: Record<
+    string,
+    { name: string; dataBindings: unknown[]; orderBindings: unknown[] }
+  > = {
     "pac-1": {
       name: "PAC",
       dataBindings: [
@@ -55,7 +65,9 @@ function makeCtx(overrides?: {
     },
     "sensor-1": {
       name: "Capteur Salon",
-      dataBindings: [{ alias: "temperature", category: "temperature", value: 25 }],
+      dataBindings: [
+        { alias: "temperature", category: "temperature", value: 25 },
+      ],
       orderBindings: [],
     },
   };
@@ -73,8 +85,16 @@ function makeCtx(overrides?: {
     equipmentManager: {
       getByIdWithDetails: (id: string) => equipments[id] ?? null,
     },
-    zoneManager: { getById: (id: string) => (id === "zone-1" ? { id, name: "Maison" } : null) },
-    logger: { info: () => {}, warn: () => {}, error: () => {}, debug: () => {} },
+    zoneManager: {
+      getById: (id: string) =>
+        id === "zone-1" ? { id, name: "Maison" } : null,
+    },
+    logger: {
+      info: () => {},
+      warn: () => {},
+      error: () => {},
+      debug: () => {},
+    },
     state: {
       get: (k: string) => stateMap.get(k),
       set: (k: string, v: unknown) => stateMap.set(k, v),
@@ -86,7 +106,9 @@ function makeCtx(overrides?: {
       parseDuration: (v: unknown) => {
         const m = /^(\d+)([smh])$/.exec(String(v));
         if (!m) return 0;
-        const mult = { s: 1000, m: 60_000, h: 3_600_000 }[m[2] as "s" | "m" | "h"];
+        const mult = { s: 1000, m: 60_000, h: 3_600_000 }[
+          m[2] as "s" | "m" | "h"
+        ];
         return Number(m[1]) * mult;
       },
       formatDuration: (ms: number) => `${ms}ms`,
@@ -95,7 +117,9 @@ function makeCtx(overrides?: {
         sunset: overrides?.sunset ?? "21:00",
         isDaylight: true,
       }),
-      ...(tariffOverride !== undefined ? { getTariff: () => tariffOverride } : {}),
+      ...(tariffOverride !== undefined
+        ? { getTariff: () => tariffOverride }
+        : {}),
       ...(overrides?.energy !== undefined ? { energy: overrides.energy } : {}),
     },
     dispatchOrder: (equipmentId: string, alias: string, value: unknown) => {
@@ -112,7 +136,8 @@ function makeCtx(overrides?: {
 function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   const enabled = opts?.enabled ?? true;
   let status: "pending" | "granted" | "denied" | "released" = "pending";
-  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null = null;
+  let req: { onGranted: () => void; onRevoked: (r: string) => void } | null =
+    null;
   let releaseCount = 0;
   const handle = {
     id: "claim-1",
@@ -125,7 +150,10 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
   };
   return {
     energy: {
-      claimCapacity: (r: { onGranted: () => void; onRevoked: (r: string) => void }) => {
+      claimCapacity: (r: {
+        onGranted: () => void;
+        onRevoked: (r: string) => void;
+      }) => {
         req = r;
         status = opts?.denied ? "denied" : "pending";
         return handle;
@@ -133,7 +161,11 @@ function makeArbiter(opts?: { enabled?: boolean; denied?: boolean }) {
       getCapacityState: () => ({
         enabled,
         availableSurplusW: enabled ? 800 : null,
-        grants: [] as Array<{ equipmentId: string; watts: number; sinceIso: string }>,
+        grants: [] as Array<{
+          equipmentId: string;
+          watts: number;
+          sinceIso: string;
+        }>,
       }),
     },
     grant: () => {
@@ -169,7 +201,12 @@ const PARAMS = {
   airingMargin: 0.5,
 };
 
-function emit(h: Handler[], equipmentId: string, alias: string, value: unknown) {
+function emit(
+  h: Handler[],
+  equipmentId: string,
+  alias: string,
+  value: unknown,
+) {
   for (const fn of [...h]) {
     fn({ type: "equipment.data.changed", equipmentId, alias, value });
   }
@@ -193,7 +230,9 @@ describe("helpers", () => {
     const wrapped = { start: "22:00", end: "06:00" };
     const NIGHT_OFF = 23 * 60;
 
-    expect(prePeakOffPeakWindow([night, afternoon, wrapped], NIGHT_OFF)).toEqual({
+    expect(
+      prePeakOffPeakWindow([night, afternoon, wrapped], NIGHT_OFF),
+    ).toEqual({
       startMin: 14 * 60 + 34,
       endMin: 17 * 60 + 4,
     });
@@ -201,9 +240,13 @@ describe("helpers", () => {
     expect(prePeakOffPeakWindow([night, wrapped], NIGHT_OFF)).toBeNull();
     expect(prePeakOffPeakWindow([], NIGHT_OFF)).toBeNull();
     // ends before noon → banks cold the day then wastes
-    expect(prePeakOffPeakWindow([{ start: "09:00", end: "11:30" }], NIGHT_OFF)).toBeNull();
+    expect(
+      prePeakOffPeakWindow([{ start: "09:00", end: "11:30" }], NIGHT_OFF),
+    ).toBeNull();
     // ends past the night cut → the night cut's territory
-    expect(prePeakOffPeakWindow([{ start: "22:00", end: "23:30" }], NIGHT_OFF)).toBeNull();
+    expect(
+      prePeakOffPeakWindow([{ start: "22:00", end: "23:30" }], NIGHT_OFF),
+    ).toBeNull();
     // several candidates → the latest-ending one (closest to the peak)
     expect(
       prePeakOffPeakWindow(
@@ -215,7 +258,9 @@ describe("helpers", () => {
       ),
     ).toEqual({ startMin: 15 * 60, endMin: 17 * 60 });
     // malformed slots are ignored
-    expect(prePeakOffPeakWindow([{ start: "bad", end: "17:00" }], NIGHT_OFF)).toBeNull();
+    expect(
+      prePeakOffPeakWindow([{ start: "bad", end: "17:00" }], NIGHT_OFF),
+    ).toBeNull();
   });
 });
 
@@ -229,13 +274,21 @@ describe("validate", () => {
 
   it("throws when an equipment slot is missing or unknown", () => {
     const { ctx } = makeCtx();
-    expect(() => createRecipe().validate({ ...PARAMS, pac: undefined }, ctx as never)).toThrow();
-    expect(() => createRecipe().validate({ ...PARAMS, weather: "nope" }, ctx as never)).toThrow(/not found/i);
+    expect(() =>
+      createRecipe().validate({ ...PARAMS, pac: undefined }, ctx as never),
+    ).toThrow();
+    expect(() =>
+      createRecipe().validate({ ...PARAMS, weather: "nope" }, ctx as never),
+    ).toThrow(/not found/i);
   });
 
   it("throws when the AC lacks power/setpoint orders", () => {
-    const { ctx } = makeCtx({ pacOrders: [{ alias: "power", category: "toggle_power" }] });
-    expect(() => createRecipe().validate(PARAMS, ctx as never)).toThrow(/setpoint/i);
+    const { ctx } = makeCtx({
+      pacOrders: [{ alias: "power", category: "toggle_power" }],
+    });
+    expect(() => createRecipe().validate(PARAMS, ctx as never)).toThrow(
+      /setpoint/i,
+    );
   });
 });
 
@@ -285,24 +338,115 @@ describe("smart-cooling instance", () => {
     b.inst.stop();
   });
 
-  it("precool engages after sustained export on a hot day, single order pair", () => {
-    const b = startAt("2026-08-06T13:00:00");
+  it("precool engages one step below comfort, then walks the setpoint down to the floor while exporting (v2.0)", () => {
+    const ctxBundle = makeCtx();
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, comfortSetpoint: 26, precoolFloor: 22 },
+      ctxBundle.ctx as never,
+    );
+    const b = { ...ctxBundle, inst };
     b.stateMap.set("closeWindowsOn", "2026-08-06"); // airing done
     emit(b.handlers, "pac-1", "temperature", 26.5); // inside band: no auto-on
     emit(b.handlers, "weather-1", "temperature", 33);
     emit(b.handlers, "grid-1", "power", -1500); // exporting 1.5 kW
 
-    vi.advanceTimersByTime(16 * 60_000); // > surplusHold
+    vi.advanceTimersByTime(16 * 60_000); // > surplusHold → engage
+    expect(b.stateMap.get("phase")).toBe("precool");
     expect(b.orders).toEqual([
       { equipmentId: "pac-1", alias: "power", value: true },
-      { equipmentId: "pac-1", alias: "setpoint", value: 24 },
+      { equipmentId: "pac-1", alias: "setpoint", value: 25.5 }, // comfort 26 - 0.5 step
     ]);
-    expect(b.stateMap.get("phase")).toBe("precool");
 
-    // Stays engaged, no order storm
+    // Sustained export: the setpoint walks down one 0.5 °C step per 5 min.
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 25,
+    });
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 24.5,
+    });
+
+    // Keeps stepping down while exporting, bounded at the configured floor (22).
+    for (let i = 0; i < 10; i++) vi.advanceTimersByTime(5 * 60_000);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 22,
+    });
+    const floorOrders = b.orders.filter(
+      (o) => o.alias === "setpoint" && o.value === 22,
+    ).length;
+    expect(floorOrders).toBe(1); // reaches the floor once, then holds (no storm)
+    inst.stop();
+  });
+
+  it("eases the setpoint back up while granted but importing past the deadband (v2.0)", () => {
+    const arb = makeArbiter();
+    const ctxBundle = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, comfortSetpoint: 26, precoolFloor: 22 },
+      ctxBundle.ctx as never,
+    );
+    const b = { ...ctxBundle, inst };
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33); // hot → claim held
+    emit(b.handlers, "grid-1", "power", -1500);
+    arb.grant();
+    vi.advanceTimersByTime(1);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 25.5,
+    }); // engage
+
+    // Still granted (the arbiter tolerates the import), but the grid now imports
+    // 600 W (> deadband) → the setpoint eases back up toward comfort, capped there.
+    emit(b.handlers, "grid-1", "power", 600);
+    vi.advanceTimersByTime(5 * 60_000);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    });
+    vi.advanceTimersByTime(15 * 60_000);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    }); // held at comfort
+    inst.stop();
+  });
+
+  it("holds the setpoint inside the surplus deadband, no order storm (v2.0)", () => {
+    const arb = makeArbiter();
+    const ctxBundle = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, comfortSetpoint: 26, precoolFloor: 22 },
+      ctxBundle.ctx as never,
+    );
+    const b = { ...ctxBundle, inst };
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500);
+    arb.grant();
+    vi.advanceTimersByTime(1); // engage, setpoint 25.5
+    const afterEngage = b.orders.length;
+
+    // Grid near balance (within ±150 W): neither branch fires → no walk orders.
+    emit(b.handlers, "grid-1", "power", 80);
     vi.advanceTimersByTime(30 * 60_000);
-    expect(b.orders).toHaveLength(2);
-    b.inst.stop();
+    expect(b.orders.length).toBe(afterEngage);
+    inst.stop();
   });
 
   it("flapping export never engages", () => {
@@ -338,7 +482,11 @@ describe("smart-cooling instance", () => {
 
     emit(b.handlers, "grid-1", "power", 400); // import: export < 100 W
     vi.advanceTimersByTime(11 * 60_000);
-    expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    });
     expect(b.stateMap.get("phase")).toBe("cooling"); // AC stays on, auto-off takes over
     b.inst.stop();
   });
@@ -372,12 +520,16 @@ describe("smart-cooling instance", () => {
     b.stateMap.set("phase", "precool"); // simulate engaged evening precool
     emit(b.handlers, "weather-1", "temperature", 31);
     vi.advanceTimersByTime(11 * 60_000); // crosses 23:00
-    const off = b.orders.filter((o) => o.alias === "power" && o.value === false);
+    const off = b.orders.filter(
+      (o) => o.alias === "power" && o.value === false,
+    );
     expect(off).toHaveLength(1);
     expect(b.stateMap.get("phase")).toBe("night_off");
 
     vi.advanceTimersByTime(30 * 60_000); // still after 23:00
-    expect(b.orders.filter((o) => o.alias === "power" && o.value === false)).toHaveLength(1);
+    expect(
+      b.orders.filter((o) => o.alias === "power" && o.value === false),
+    ).toHaveLength(1);
     b.inst.stop();
   });
 
@@ -447,7 +599,9 @@ describe("smart-cooling instance", () => {
     b.stateMap.set("day", "2026-08-06");
     const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
     emit(b.handlers, "pac-1", "temperature", 24.8); // <= 26 - 1
-    expect(b.orders).toEqual([{ equipmentId: "pac-1", alias: "power", value: false }]);
+    expect(b.orders).toEqual([
+      { equipmentId: "pac-1", alias: "power", value: false },
+    ]);
     expect(b.stateMap.get("phase")).toBe("comfort");
     inst.stop();
   });
@@ -484,7 +638,11 @@ describe("smart-cooling instance", () => {
     vi.advanceTimersByTime(11 * 60_000); // disengage → cooling
     expect(b.stateMap.get("phase")).toBe("cooling");
     vi.advanceTimersByTime(11 * 60_000); // order gap passes → auto-off (24.5 <= 25)
-    expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "power", value: false });
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "power",
+      value: false,
+    });
     expect(b.stateMap.get("phase")).toBe("comfort");
     b.inst.stop();
   });
@@ -583,7 +741,11 @@ describe("off-peak boost (issue #3)", () => {
     vi.setSystemTime(new Date("2026-08-06T17:05:00"));
     vi.advanceTimersByTime(30_000);
     expect(b.stateMap.get("phase")).toBe("cooling");
-    expect(b.orders[2]).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
+    expect(b.orders[2]).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    });
     expect(b.orders).toHaveLength(3);
     inst.stop();
   });
@@ -611,7 +773,9 @@ describe("off-peak boost (issue #3)", () => {
   });
 
   it("inert when the tariff is not configured", () => {
-    const b = makeCtx({ tariff: { configured: false, offPeakToday: [], isOffPeakNow: null } });
+    const b = makeCtx({
+      tariff: { configured: false, offPeakToday: [], isOffPeakNow: null },
+    });
     vi.setSystemTime(new Date("2026-08-06T15:00:00"));
     const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
     emit(b.handlers, "pac-1", "temperature", 26);
@@ -622,7 +786,11 @@ describe("off-peak boost (issue #3)", () => {
 
   it("inert on a night-only contract", () => {
     const b = makeCtx({
-      tariff: { configured: true, offPeakToday: [{ start: "00:04", end: "05:34" }], isOffPeakNow: false },
+      tariff: {
+        configured: true,
+        offPeakToday: [{ start: "00:04", end: "05:34" }],
+        isOffPeakNow: false,
+      },
     });
     vi.setSystemTime(new Date("2026-08-06T15:00:00"));
     const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
@@ -635,7 +803,10 @@ describe("off-peak boost (issue #3)", () => {
   it("inert when disabled via the slot", () => {
     const b = makeCtx({ tariff: TARIFF });
     vi.setSystemTime(new Date("2026-08-06T15:00:00"));
-    const inst = createRecipe().createInstance({ ...PARAMS, tariffBoostEnabled: false }, b.ctx as never);
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, tariffBoostEnabled: false },
+      b.ctx as never,
+    );
     emit(b.handlers, "pac-1", "temperature", 26);
     emit(b.handlers, "weather-1", "temperature", 32);
     expect(b.orders).toEqual([]);
@@ -678,12 +849,16 @@ describe("surplus arbiter (spec 140)", () => {
     expect(b.stateMap.get("phase")).toBe("precool");
     expect(b.orders).toEqual([
       { equipmentId: "pac-1", alias: "power", value: true },
-      { equipmentId: "pac-1", alias: "setpoint", value: 24 },
+      { equipmentId: "pac-1", alias: "setpoint", value: 25.5 }, // comfort 26 - 0.5 step
     ]);
 
     arb.revoke();
     vi.advanceTimersByTime(1);
-    expect(b.orders.at(-1)).toEqual({ equipmentId: "pac-1", alias: "setpoint", value: 26 });
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    });
     expect(b.stateMap.get("phase")).toBe("cooling"); // AC stays on
     inst.stop();
   });
@@ -783,7 +958,11 @@ describe("surplus arbiter (spec 140)", () => {
       claimCapacity: () => {
         throw new Error("boom");
       },
-      getCapacityState: () => ({ enabled: true, availableSurplusW: 800, grants: [] }),
+      getCapacityState: () => ({
+        enabled: true,
+        availableSurplusW: 800,
+        grants: [],
+      }),
     };
     const b = makeCtx({ energy: throwing });
     vi.setSystemTime(new Date("2026-08-06T13:00:00"));
