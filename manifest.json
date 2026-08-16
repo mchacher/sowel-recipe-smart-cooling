@@ -2,7 +2,7 @@
   "id": "smart-cooling",
   "type": "recipe",
   "name": "Smart Cooling",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Solar-aware AC optimizer: morning airing notifications, surplus-proportional pre-cooling that tracks the available solar, comfort setpoint, fixed-time night cut",
   "icon": "Snowflake",
   "repo": "mchacher/sowel-recipe-smart-cooling",

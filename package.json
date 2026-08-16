@@ -1,6 +1,6 @@
 {
   "name": "sowel-recipe-smart-cooling",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Sowel recipe: Smart Cooling — solar-aware AC optimization with morning airing assist",
   "type": "module",
   "main": "dist/index.js",
