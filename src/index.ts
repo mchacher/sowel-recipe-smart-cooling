@@ -15,8 +15,11 @@
 //  3. Comfort: restore the normal setpoint when neither signal holds.
 //  4. Night cut: switch the AC off at a fixed time (once per day).
 //
-// The recipe only issues orders on phase TRANSITIONS — a manual change
-// between transitions is never overridden.
+// The recipe issues orders on phase TRANSITIONS — a manual change between
+// transitions is not overridden. The one exception is the v2.0 surplus-
+// proportional walk: while pre-cooling on surplus it nudges the setpoint every
+// few minutes to track the available solar, so a manual setpoint change made
+// mid-precool is re-driven by the walk (it yields again once the episode ends).
 // ============================================================
 
 // Minimal types for RecipeContext (injected at runtime by Sowel core)
@@ -223,6 +226,16 @@ const MIN_ORDER_GAP_MS = 10 * 60_000;
 // deficit hold, so the recipe backs off an over-import before the arbiter revokes.
 // This turns the inverter AC into a solar sink that tracks the available surplus,
 // rather than an on/off load that needs a full surplus to ever engage.
+//
+// These three constants are conservative starting points, not hardware-tuned:
+// a single 0.5 °C step can swing the grid past the ±150 W band, so the loop may
+// gently limit-cycle (one step up/down every 5 min). Widen the band or shrink
+// the step if a given AC hunts. Recipes cannot run on the shadow instance, so
+// the values are unverified on real hardware and expected to be tuned live.
+//
+// The walk state (precoolTarget/precoolBySurplus) is in-memory: after a Sowel
+// restart mid-precool it is lost, so the episode degrades to the last fixed
+// setpoint (no walking) until surplus collapses and §4 exits — safe, not a hang.
 const SETPOINT_STEP_C = 0.5;
 const PRECOOL_WALK_MS = 5 * 60_000;
 const SURPLUS_DEADBAND_W = 150;
@@ -957,6 +970,30 @@ export function createRecipe(): RecipeDefinition {
           precoolTarget = null;
           precoolBySurplus = false;
           setPhase("cooling");
+        }
+
+        // 4a. Surplus died mid-precool but an off-peak window is now holding the
+        // episode (the §4 exit above is blocked by !inBoostWindow): hand it to
+        // the fixed off-peak floor instead of letting the walk ease the setpoint
+        // back up to comfort — the point of the off-peak boost is to bank cheap
+        // kWh at the floor, not to chase a surplus that is gone.
+        if (
+          phase === "precool" &&
+          inBoostWindow &&
+          precoolBySurplus &&
+          surplusGone
+        ) {
+          precoolBySurplus = false;
+          if (precoolTarget !== precoolFloor) {
+            precoolTarget = precoolFloor;
+            lastSetpointOrderAt = now;
+            sendOrder(
+              setpointOrderAlias,
+              precoolFloor,
+              "precool boost floor (surplus gone)",
+              true,
+            );
+          }
         }
 
         // 4b. Proportional walk (v2.0): while pre-cooling on surplus, glide the

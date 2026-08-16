@@ -750,6 +750,43 @@ describe("off-peak boost (issue #3)", () => {
     inst.stop();
   });
 
+  it("hands a surplus precool to the off-peak floor when the surplus dies mid-window (v2.0)", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy, tariff: TARIFF });
+    // 14:00 — BEFORE the 14:34-17:04 window, so the surplus engages, not the boost.
+    vi.setSystemTime(new Date("2026-08-06T14:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, comfortSetpoint: 26, precoolFloor: 22 },
+      b.ctx as never,
+    );
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33); // hot → claim held
+    emit(b.handlers, "grid-1", "power", -1500); // exporting → surplus engage
+    arb.grant();
+    vi.advanceTimersByTime(1);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 25.5,
+    }); // surplus engage
+
+    // Move into the off-peak window, surplus collapses (arbiter revokes): the
+    // window still holds the episode, so it banks at the floor instead of easing
+    // the setpoint back up to comfort.
+    vi.setSystemTime(new Date("2026-08-06T15:00:00"));
+    emit(b.handlers, "grid-1", "power", 400); // now importing
+    arb.revoke();
+    vi.advanceTimersByTime(1);
+    expect(b.stateMap.get("phase")).toBe("precool"); // the window keeps it engaged
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 22,
+    });
+    inst.stop();
+  });
+
   it("stays idle outside the window (peak hours) without surplus", () => {
     const b = makeCtx({ tariff: TARIFF });
     // 13:30: HP before the window, and past the morning-airing latch (13:00)
@@ -860,6 +897,51 @@ describe("surplus arbiter (spec 140)", () => {
       value: 26,
     });
     expect(b.stateMap.get("phase")).toBe("cooling"); // AC stays on
+    inst.stop();
+  });
+
+  it("re-engages cleanly after a revoke: the next grant starts the walk fresh (v2.0)", () => {
+    const arb = makeArbiter();
+    const b = makeCtx({ energy: arb.energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(
+      { ...PARAMS, comfortSetpoint: 26, precoolFloor: 22 },
+      b.ctx as never,
+    );
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33);
+    emit(b.handlers, "grid-1", "power", -1500);
+
+    arb.grant();
+    vi.advanceTimersByTime(1);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 25.5,
+    });
+    arb.revoke();
+    vi.advanceTimersByTime(1);
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 26,
+    }); // comfort
+    expect(b.stateMap.get("phase")).toBe("cooling");
+
+    // A fresh grant re-engages precool from comfort - 0.5 (the reset worked: the
+    // walk target did not carry over the previous episode's value). Wait past
+    // the 10-min power-order gap so the re-engage power order is not rate-limited.
+    vi.advanceTimersByTime(11 * 60_000);
+    emit(b.handlers, "grid-1", "power", -1500);
+    arb.grant();
+    vi.advanceTimersByTime(1);
+    expect(b.stateMap.get("phase")).toBe("precool");
+    expect(b.orders.at(-1)).toEqual({
+      equipmentId: "pac-1",
+      alias: "setpoint",
+      value: 25.5,
+    });
     inst.stop();
   });
 
