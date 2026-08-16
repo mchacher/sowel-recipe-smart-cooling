@@ -863,6 +863,32 @@ describe("off-peak boost (issue #3)", () => {
 });
 
 describe("surplus arbiter (spec 140)", () => {
+  it("claims pre-cool with slack high so it yields to must-run loads (v2.1)", () => {
+    vi.useFakeTimers();
+    let captured: { slack?: string } | null = null;
+    const energy = {
+      claimCapacity: (r: { slack?: string }) => {
+        captured = r;
+        return { id: "c", status: () => "pending", release: () => {} };
+      },
+      getCapacityState: () => ({
+        enabled: true,
+        availableSurplusW: 800,
+        grants: [],
+      }),
+    };
+    const b = makeCtx({ energy });
+    vi.setSystemTime(new Date("2026-08-06T13:00:00"));
+    const inst = createRecipe().createInstance(PARAMS, b.ctx as never);
+    b.stateMap.set("closeWindowsOn", "2026-08-06");
+    emit(b.handlers, "pac-1", "temperature", 26.5);
+    emit(b.handlers, "weather-1", "temperature", 33); // hot → claim held
+    expect(captured).not.toBeNull();
+    expect(captured!.slack).toBe("high");
+    inst.stop();
+    vi.useRealTimers();
+  });
+
   beforeEach(() => {
     vi.useFakeTimers();
   });

@@ -880,7 +880,17 @@ export function createRecipe(): RecipeDefinition {
                   // (core #550): set "Import toléré (W)" on the AC to let it
                   // engage on a partial surplus. Omitting it here = the profile
                   // value (0 = only full surplus, the previous behaviour).
-                  slack: "some",
+                  //
+                  // slack "high" (v2.1): pre-cooling is opportunistic banking —
+                  // the most sheddable thing on the grid — so it must sit in the
+                  // same urgency tier as the pool loads, NOT ahead of them. As a
+                  // proportional solar sink the AC would otherwise consume the
+                  // surplus down to ~zero and starve a small must-run load (the
+                  // pool pump) that yields with slack "high". With both at "high",
+                  // the arbiter priority list decides the order (put the pump
+                  // first, the AC second): the pump takes its slice, the AC mops
+                  // up the rest.
+                  slack: "high",
                   note: "precool boost",
                   onGranted: () => {
                     arbiterGranted = true;
