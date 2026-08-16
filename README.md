@@ -17,11 +17,16 @@ natural morning-airing habit.
    recipe instance, source keys `openWindows` / `closeWindows`). Each
    fires at most once per day. Requires Sowel ≥ 1.31.1 (boolean mappings
    notify on the rising edge only).
-2. **Solar pre-cooling** — on a hot day (outdoor ≥ threshold, or indoor
-   above the comfort setpoint), when the grid export stays above the
-   surplus threshold for the hold duration, the AC is switched on at the
-   pre-cool setpoint. When the surplus collapses, the comfort setpoint is
-   restored.
+2. **Solar pre-cooling (surplus-proportional, v2)** — on a hot day (outdoor
+   ≥ threshold, or indoor above the comfort setpoint), when surplus is
+   available the AC is switched on and its setpoint is walked toward the
+   grid balance: it glides between the **pre-cool floor** and the comfort
+   setpoint, stepping down while exporting (draw more of the surplus) and
+   up while importing (ease off), so the inverter tracks the available
+   solar instead of slamming a fixed setpoint. How much grid import the AC
+   will accept to engage on a partial surplus is set on the equipment
+   ("Import toléré (W)" in the energy profile, Sowel ≥ 1.50), not here.
+   When the surplus collapses, the comfort setpoint is restored.
    **Off-peak boost (v1.3)** — on the same hot days, pre-cooling also
    engages during the afternoon off-peak tariff window (the off-peak
    slot ending between noon and the night cut), even with zero surplus:
@@ -47,24 +52,24 @@ the morning (before 13:00).
 
 ## Slots
 
-| Slot                | Default | Meaning                                          |
-| ------------------- | ------- | ------------------------------------------------ |
-| Air conditioner     | —       | thermostat with power + setpoint orders          |
-| Grid meter          | —       | main energy meter, signed power (+import/−export)|
-| Outdoor temperature | —       | equipment providing outdoor temp (weather station)|
-| Indoor temperature  | AC probe | optional; a continuous sensor (weather indoor module) is strongly recommended — the AC's own probe freezes while off |
-| Comfort setpoint    | 26 °C   | normal cooling setpoint                          |
-| Pre-cool setpoint   | 24 °C   | setpoint while surplus is available              |
-| Auto-on margin      | 1 °C    | AC on when indoor ≥ comfort + margin             |
-| Auto-off margin     | 1 °C    | AC off when indoor ≤ comfort − margin            |
-| Surplus threshold   | 500 W   | export considered usable                         |
-| Surplus hold        | 15m     | sustained export before engaging                 |
-| Hot day threshold   | 30 °C   | outdoor temp beyond which pre-cooling engages    |
-| Off-peak boost      | on      | pre-cool during the afternoon off-peak window (Sowel ≥ 1.37) |
-| Night off time      | 23:00   | daily AC cut                                     |
-| Airing notifications| on      | morning open/close notifications                 |
-| Airing minimum      | 18 °C   | "bearable" floor to suggest opening              |
-| Airing close margin | 0.5 °C  | close when T_out ≥ T_in − margin                 |
+| Slot                 | Default  | Meaning                                                                                                                                              |
+| -------------------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Air conditioner      | —        | thermostat with power + setpoint orders                                                                                                              |
+| Grid meter           | —        | main energy meter, signed power (+import/−export)                                                                                                    |
+| Outdoor temperature  | —        | equipment providing outdoor temp (weather station)                                                                                                   |
+| Indoor temperature   | AC probe | optional; a continuous sensor (weather indoor module) is strongly recommended — the AC's own probe freezes while off                                 |
+| Comfort setpoint     | 26 °C    | normal cooling setpoint                                                                                                                              |
+| Pre-cool floor       | 22 °C    | lowest setpoint at full surplus; the setpoint glides between this floor and comfort (was "Pre-cool setpoint", still honoured for existing instances) |
+| Auto-on margin       | 1 °C     | AC on when indoor ≥ comfort + margin                                                                                                                 |
+| Auto-off margin      | 1 °C     | AC off when indoor ≤ comfort − margin                                                                                                                |
+| Surplus threshold    | 500 W    | export considered usable                                                                                                                             |
+| Surplus hold         | 15m      | sustained export before engaging                                                                                                                     |
+| Hot day threshold    | 30 °C    | outdoor temp beyond which pre-cooling engages                                                                                                        |
+| Off-peak boost       | on       | pre-cool during the afternoon off-peak window (Sowel ≥ 1.37)                                                                                         |
+| Night off time       | 23:00    | daily AC cut                                                                                                                                         |
+| Airing notifications | on       | morning open/close notifications                                                                                                                     |
+| Airing minimum       | 18 °C    | "bearable" floor to suggest opening                                                                                                                  |
+| Airing close margin  | 0.5 °C   | close when T_out ≥ T_in − margin                                                                                                                     |
 
 ## State keys (visible in the instance detail, usable in notifications)
 
@@ -75,7 +80,7 @@ the morning (before 13:00).
 
 ```bash
 npm install
-npm test          # vitest, 34 scenarios
+npm test          # vitest, 45 scenarios
 npm run build     # tsc → dist/
 ```
 
